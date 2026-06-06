@@ -2,9 +2,11 @@ require("dotenv").config();
 
 const {
   Client,
+  ChannelType,
   GatewayIntentBits,
   EmbedBuilder,
   AttachmentBuilder,
+  PermissionFlagsBits,
 } = require("discord.js");
 
 const { chromium } = require("playwright");
@@ -27,8 +29,12 @@ const CONCURRENT_CHECKS = Number(process.env.CONCURRENT_CHECKS || 1);
 const ACTIVE_CONFIRMATIONS = Number(process.env.ACTIVE_CONFIRMATIONS || 3);
 const BROWSER_RESTART_MINUTES = Number(process.env.BROWSER_RESTART_MINUTES || 30);
 const MONITORS_FILE = process.env.MONITORS_FILE || path.join(__dirname, "monitors.json");
+const GUILD_CONFIGS_FILE = process.env.GUILD_CONFIGS_FILE || path.join(__dirname, "guild-configs.json");
+const RECENT_UNBANS_FILE = process.env.RECENT_UNBANS_FILE || path.join(__dirname, "recent-unbans.json");
 
 const monitors = {};
+const guildConfigs = {};
+let recentUnbans = [];
 const queue = [];
 
 let activeJobs = 0;
@@ -78,13 +84,15 @@ function normalizeMonitorRecord(key, item) {
   if (!item || typeof item !== "object") return null;
 
   const username = String(item.username || "").trim();
+  const guildId = String(item.guildId || "dm").trim();
   const userId = String(item.userId || "").trim();
   const channelId = String(item.channelId || "").trim();
 
-  if (!username || !userId || !channelId) return null;
+  if (!username || !guildId || !userId || !channelId) return null;
 
   return {
     username,
+    guildId,
     userId,
     channelId,
     lastStatus: item.lastStatus || "unknown",
@@ -129,6 +137,97 @@ function saveMonitors() {
   } catch (error) {
     console.log("Save monitors error:", error.message);
   }
+}
+
+function writeJsonAtomic(filePath, value) {
+  const folder = path.dirname(filePath);
+  fs.mkdirSync(folder, { recursive: true });
+
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2));
+  fs.renameSync(tmpPath, filePath);
+}
+
+function getGuildConfig(guildId) {
+  if (!guildConfigs[guildId]) {
+    guildConfigs[guildId] = {
+      guildId,
+      botName: "",
+      commandChannelId: null,
+      privateCategoryId: null,
+      rooms: {},
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+  }
+
+  if (!guildConfigs[guildId].rooms) guildConfigs[guildId].rooms = {};
+  return guildConfigs[guildId];
+}
+
+function loadGuildConfigs() {
+  try {
+    if (!fs.existsSync(GUILD_CONFIGS_FILE)) {
+      console.log(`No guild config store found at ${GUILD_CONFIGS_FILE}`);
+      return;
+    }
+
+    const saved = JSON.parse(fs.readFileSync(GUILD_CONFIGS_FILE, "utf8"));
+    let count = 0;
+
+    for (const [guildId, config] of Object.entries(saved)) {
+      if (!config || typeof config !== "object") continue;
+      guildConfigs[guildId] = {
+        guildId,
+        botName: String(config.botName || ""),
+        commandChannelId: config.commandChannelId || null,
+        privateCategoryId: config.privateCategoryId || null,
+        rooms: config.rooms && typeof config.rooms === "object" ? config.rooms : {},
+        createdAt: Number(config.createdAt || Date.now()),
+        updatedAt: Number(config.updatedAt || Date.now()),
+      };
+      count++;
+    }
+
+    console.log(`Loaded ${count} guild config(s) from ${GUILD_CONFIGS_FILE}`);
+  } catch (error) {
+    console.log("Load guild configs error:", error.message);
+  }
+}
+
+function saveGuildConfigs() {
+  try {
+    writeJsonAtomic(GUILD_CONFIGS_FILE, guildConfigs);
+  } catch (error) {
+    console.log("Save guild configs error:", error.message);
+  }
+}
+
+function loadRecentUnbans() {
+  try {
+    if (!fs.existsSync(RECENT_UNBANS_FILE)) {
+      console.log(`No recent unban store found at ${RECENT_UNBANS_FILE}`);
+      return;
+    }
+
+    const saved = JSON.parse(fs.readFileSync(RECENT_UNBANS_FILE, "utf8"));
+    recentUnbans = Array.isArray(saved) ? saved.filter((item) => item && item.username) : [];
+    console.log(`Loaded ${recentUnbans.length} recent unban record(s) from ${RECENT_UNBANS_FILE}`);
+  } catch (error) {
+    console.log("Load recent unbans error:", error.message);
+  }
+}
+
+function saveRecentUnbans() {
+  try {
+    writeJsonAtomic(RECENT_UNBANS_FILE, recentUnbans.slice(-500));
+  } catch (error) {
+    console.log("Save recent unbans error:", error.message);
+  }
+}
+
+function monitorKey(guildId, userId, username) {
+  return `${guildId}:${userId}:${username.toLowerCase()}`;
 }
 
 function isInstagramUrl(text) {
@@ -778,6 +877,252 @@ async function checkInstagram(username) {
   }
 }
 
+function isAdmin(member) {
+  return Boolean(member?.permissions?.has(PermissionFlagsBits.ManageGuild));
+}
+
+function sanitizeChannelName(value) {
+  return String(value || "user")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 70) || "user";
+}
+
+function getConfiguredBotName(guild) {
+  const config = getGuildConfig(guild.id);
+  return config.botName || guild.members.me?.displayName || client.user.username;
+}
+
+function isUserRoom(config, userId, channelId) {
+  return config.rooms?.[userId] === channelId;
+}
+
+function getUserMonitorEntries(guildId, userId) {
+  return Object.entries(monitors)
+    .filter(([, item]) => item.guildId === guildId && item.userId === userId);
+}
+
+function recordRecentUnban(meta, username, result, duration) {
+  if (!meta?.guildId || !meta?.userId) return;
+
+  recentUnbans.push({
+    guildId: meta.guildId,
+    userId: meta.userId,
+    username,
+    followers: result.stats?.followers || "0",
+    following: result.stats?.following || "0",
+    duration,
+    at: Date.now(),
+  });
+
+  recentUnbans = recentUnbans.slice(-500);
+  saveRecentUnbans();
+}
+
+function parseUsernames(input) {
+  const usernames = [];
+  const seen = new Set();
+
+  for (const part of String(input || "").split(/\s+/)) {
+    const username = getUsername(part);
+    if (!username || username.includes(" ") || username.length < 2) continue;
+
+    const key = username.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    usernames.push(username);
+  }
+
+  return usernames.slice(0, 10);
+}
+
+async function applyServerBotName(message, name) {
+  const config = getGuildConfig(message.guild.id);
+  config.botName = name;
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+
+  try {
+    const me = message.guild.members.me || await message.guild.members.fetchMe();
+    await me.setNickname(name);
+    return true;
+  } catch (error) {
+    console.log("Set nickname error:", error.message);
+    return false;
+  }
+}
+
+function resolveTextChannel(message, args) {
+  const mentioned = message.mentions.channels.first();
+  if (mentioned?.type === ChannelType.GuildText) return mentioned;
+
+  const raw = args[0]?.replace(/[<#>]/g, "");
+  if (!raw) return message.channel;
+
+  const byId = message.guild.channels.cache.get(raw);
+  if (byId?.type === ChannelType.GuildText) return byId;
+
+  return message.guild.channels.cache.find(
+    (channel) => channel.type === ChannelType.GuildText && channel.name.toLowerCase() === raw.toLowerCase()
+  ) || message.channel;
+}
+
+function resolveCategory(message, args) {
+  const raw = args.join(" ").trim().replace(/[<#>]/g, "");
+  if (!raw) return message.channel.parent || null;
+  if (raw.toLowerCase() === "none" || raw.toLowerCase() === "clear") return null;
+
+  const byId = message.guild.channels.cache.get(raw);
+  if (byId?.type === ChannelType.GuildCategory) return byId;
+
+  return message.guild.channels.cache.find(
+    (channel) => channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === raw.toLowerCase()
+  ) || null;
+}
+
+async function ensureUserRoom(message) {
+  const guild = message.guild;
+  const config = getGuildConfig(guild.id);
+  const existingId = config.rooms?.[message.author.id];
+
+  if (existingId) {
+    const existing = guild.channels.cache.get(existingId) || await guild.channels.fetch(existingId).catch(() => null);
+    if (existing) return existing;
+  }
+
+  const name = `unban-${sanitizeChannelName(message.member?.displayName || message.author.username)}`;
+  const overwrites = [
+    {
+      id: guild.roles.everyone.id,
+      deny: [PermissionFlagsBits.ViewChannel],
+    },
+    {
+      id: message.author.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.EmbedLinks,
+        PermissionFlagsBits.AttachFiles,
+      ],
+    },
+    {
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.EmbedLinks,
+        PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.ManageMessages,
+      ],
+    },
+  ];
+
+  const channel = await guild.channels.create({
+    name,
+    type: ChannelType.GuildText,
+    parent: config.privateCategoryId || undefined,
+    topic: `Private unban bot room for ${message.author.tag} (${message.author.id})`,
+    permissionOverwrites: overwrites,
+  });
+
+  config.rooms[message.author.id] = channel.id;
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+
+  return channel;
+}
+
+async function getUserCommandChannel(message) {
+  const config = getGuildConfig(message.guild.id);
+  if (isUserRoom(config, message.author.id, message.channel.id)) return message.channel;
+
+  if (config.commandChannelId && message.channel.id !== config.commandChannelId) {
+    await message.reply(`Use <#${config.commandChannelId}> or your private room.`);
+    return null;
+  }
+
+  const room = await ensureUserRoom(message);
+  await message.delete().catch(() => {});
+
+  if (room.id !== message.channel.id) {
+    await message.channel.send(`${message.author}, your private bot room is <#${room.id}>.`)
+      .then((msg) => setTimeout(() => msg.delete().catch(() => {}), 15000))
+      .catch(() => {});
+  }
+
+  return room;
+}
+
+function buildHelpEmbed(guild) {
+  const botName = getConfiguredBotName(guild);
+
+  return new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("ℹ️ Bot Commands")
+    .setDescription("Commands to monitor Instagram accounts:")
+    .addFields(
+      { name: "!chat", value: "Open your private bot room. (`!chat`)" },
+      { name: "!t", value: "Monitor Instagram usernames. (`!t <username1> [username2] ...`)" },
+      { name: "!stop", value: "Stop monitoring a username. (`!stop <username>`)" },
+      { name: "!list", value: "List your monitored usernames. (`!list`)" },
+      { name: "!clearall", value: "Clear your list. (`!clearall`)" },
+      { name: "!stats", value: "Show monitoring statistics. (`!stats`)" },
+      { name: "!sesun", value: "Show recently unbanned accounts. (`!sesun <hours>`)" },
+      { name: "Admin setup", value: "`!setupname <name>`\n`!setupchannel [#channel]`\n`!setupcategory <category id/name>`\n`!setupinfo`" }
+    )
+    .setFooter({ text: botName });
+}
+
+function buildStatsEmbed(message) {
+  const guildId = message.guild.id;
+  const userId = message.author.id;
+  const userEntries = getUserMonitorEntries(guildId, userId).map(([, item]) => item);
+  const guildEntries = Object.values(monitors).filter((item) => item.guildId === guildId);
+  const counts = {};
+
+  for (const item of guildEntries) {
+    counts[item.lastStatus || "unknown"] = (counts[item.lastStatus || "unknown"] || 0) + 1;
+  }
+
+  return new EmbedBuilder()
+    .setColor(0x2b2d31)
+    .setTitle("📊 Bot Stats")
+    .setDescription(
+      `**Your monitored accounts:** ${userEntries.length}\n` +
+      `**Server monitored accounts:** ${guildEntries.length}\n` +
+      `**Active:** ${counts.active || 0}\n` +
+      `**Banned/Login/Unknown:** ${(counts.banned || 0) + (counts.login || 0) + (counts.unknown || 0)}`
+    );
+}
+
+function buildRecentUnbansEmbed(message, hours) {
+  const since = Date.now() - hours * 60 * 60 * 1000;
+  const admin = isAdmin(message.member);
+  const rows = recentUnbans
+    .filter((item) => item.guildId === message.guild.id)
+    .filter((item) => admin || item.userId === message.author.id)
+    .filter((item) => item.at >= since)
+    .slice(-15)
+    .reverse();
+
+  const description = rows.length
+    ? rows.map((item) => {
+      const when = new Date(item.at).toISOString().replace("T", " ").slice(0, 16);
+      return `• @${item.username} — ${when} UTC — ${item.followers} followers`;
+    }).join("\n")
+    : "No recently unbanned accounts in that time window.";
+
+  return new EmbedBuilder()
+    .setColor(0x00ff44)
+    .setTitle(`Recently Unbanned (${hours}h)`)
+    .setDescription(description);
+}
+
 function recoveredEmbed(username, result, duration) {
   const attachment = new AttachmentBuilder(result.screenshot, {
     name: "profile.png",
@@ -828,9 +1173,10 @@ function unavailableEmbed(username, result) {
   return payload;
 }
 
-async function sendRecovered(channel, username, result, duration) {
+async function sendRecovered(channel, username, result, duration, meta = null) {
   const payload = recoveredEmbed(username, result, duration);
   await channel.send(payload);
+  recordRecentUnban(meta, username, result, duration);
   safeDelete(result.screenshot);
 }
 
@@ -844,6 +1190,8 @@ client.once("ready", async () => {
   console.log(`Discord bot online: ${client.user.tag}`);
 
   loadMonitors();
+  loadGuildConfigs();
+  loadRecentUnbans();
 
   sharedBrowser = await launchBrowser();
 
@@ -998,6 +1346,228 @@ client.on("messageCreate", async (message) => {
   return sendUnavailable(dmChannel, username, result);
 });
 
+client.removeAllListeners("messageCreate");
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+
+  const content = message.content.trim();
+  if (!content.startsWith("!")) return;
+
+  if (!message.guild) {
+    return message.reply("Please use the bot inside your server. Private chats are created as server channels.");
+  }
+
+  const parts = content.split(/\s+/);
+  const command = parts.shift().toLowerCase();
+  const args = parts;
+  const guildId = message.guild.id;
+  const userId = message.author.id;
+  const config = getGuildConfig(guildId);
+
+  if (command === "!help") {
+    return message.channel.send({ embeds: [buildHelpEmbed(message.guild)] });
+  }
+
+  if (command === "!setupname") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const name = args.join(" ").trim();
+    if (name.length < 2 || name.length > 32) {
+      return message.reply("Use: `!setupname Pablo Unbans` (2-32 characters).");
+    }
+
+    const nicknameChanged = await applyServerBotName(message, name);
+    return message.reply(
+      nicknameChanged
+        ? `Server bot name set to **${name}**.`
+        : `Saved **${name}**, but I could not change my nickname. Give me Manage Nicknames permission.`
+    );
+  }
+
+  if (command === "!setupchannel") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const channel = resolveTextChannel(message, args);
+    config.commandChannelId = channel.id;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+
+    return message.reply(`Command lobby set to ${channel}. Users can type \`!chat\` or \`!t username\` there.`);
+  }
+
+  if (command === "!setupcategory") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const category = resolveCategory(message, args);
+    config.privateCategoryId = category?.id || null;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+
+    return message.reply(
+      category
+        ? `Private user rooms will be created under **${category.name}**.`
+        : "Private user rooms will be created without a category."
+    );
+  }
+
+  if (command === "!setupinfo") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle("Server Bot Setup")
+      .setDescription(
+        `**Bot name:** ${config.botName || getConfiguredBotName(message.guild)}\n` +
+        `**Command lobby:** ${config.commandChannelId ? `<#${config.commandChannelId}>` : "Not set"}\n` +
+        `**Private category:** ${config.privateCategoryId ? `<#${config.privateCategoryId}>` : "Not set"}\n` +
+        `**Private rooms:** ${Object.keys(config.rooms || {}).length}`
+      );
+
+    return message.channel.send({ embeds: [embed] });
+  }
+
+  if (command === "!chat") {
+    try {
+      const room = await ensureUserRoom(message);
+      return message.reply(`Your private bot room is ${room}.`);
+    } catch (error) {
+      console.log("Create private room error:", error.message);
+      return message.reply("I could not create your private room. Give me Manage Channels permission.");
+    }
+  }
+
+  const monitorCommands = new Set(["!t", "!unban"]);
+  const stopCommands = new Set(["!stop", "!cancel"]);
+  const userCommands = new Set(["!list", "!clearall", "!stats", "!sesun"]);
+
+  if (!monitorCommands.has(command) && !stopCommands.has(command) && !userCommands.has(command)) {
+    return;
+  }
+
+  let targetChannel;
+  try {
+    targetChannel = await getUserCommandChannel(message);
+  } catch (error) {
+    console.log("Private command channel error:", error.message);
+    return message.reply("I could not open your private bot room. Give me Manage Channels permission.");
+  }
+
+  if (!targetChannel) return;
+
+  if (monitorCommands.has(command)) {
+    const usernames = parseUsernames(args.join(" "));
+    if (!usernames.length) {
+      return targetChannel.send("Use: `!t <username1> [username2] ...`");
+    }
+
+    await targetChannel.send(`Checking ${usernames.map((u) => `@${u}`).join(", ")}...`);
+
+    for (const username of usernames) {
+      const key = monitorKey(guildId, userId, username);
+      if (monitors[key]) {
+        await targetChannel.send(`Already monitoring @${username}.`);
+        continue;
+      }
+
+      const startedAt = Date.now();
+      const result = await enqueueCheck(username);
+      const duration = formatDuration(Date.now() - startedAt);
+
+      if (result.status === "error") {
+        await targetChannel.send(`Error checking @${username}\n\`${result.error}\``);
+        continue;
+      }
+
+      if (result.status === "active") {
+        await sendRecovered(targetChannel, username, result, duration, { guildId, userId });
+
+        monitors[key] = {
+          username,
+          guildId,
+          userId,
+          channelId: targetChannel.id,
+          lastStatus: "active",
+          startedAt,
+          bannedStartedAt: null,
+          activeHits: 0,
+        };
+        saveMonitors();
+        continue;
+      }
+
+      monitors[key] = {
+        username,
+        guildId,
+        userId,
+        channelId: targetChannel.id,
+        lastStatus: result.status,
+        startedAt,
+        bannedStartedAt: startedAt,
+        activeHits: 0,
+      };
+      saveMonitors();
+
+      await sendUnavailable(targetChannel, username, result);
+    }
+
+    return;
+  }
+
+  if (stopCommands.has(command)) {
+    if (args[0]?.toLowerCase() === "all") {
+      let removed = 0;
+      for (const [key, item] of Object.entries(monitors)) {
+        if (item.guildId === guildId && item.userId === userId) {
+          delete monitors[key];
+          removed++;
+        }
+      }
+      saveMonitors();
+      return targetChannel.send(`Stopped monitoring ${removed} account(s).`);
+    }
+
+    const username = getUsername(args[0] || "");
+    if (!username) return targetChannel.send("Use: `!stop <username>`");
+
+    const key = monitorKey(guildId, userId, username);
+    if (!monitors[key]) return targetChannel.send(`You are not monitoring @${username}.`);
+
+    delete monitors[key];
+    saveMonitors();
+    return targetChannel.send(`Stopped monitoring @${username}.`);
+  }
+
+  if (command === "!clearall") {
+    let removed = 0;
+    for (const [key, item] of Object.entries(monitors)) {
+      if (item.guildId === guildId && item.userId === userId) {
+        delete monitors[key];
+        removed++;
+      }
+    }
+    saveMonitors();
+    return targetChannel.send(`Cleared ${removed} monitored account(s).`);
+  }
+
+  if (command === "!list") {
+    const entries = getUserMonitorEntries(guildId, userId)
+      .map(([, item]) => `• @${item.username} — ${item.lastStatus}`)
+      .join("\n");
+
+    return targetChannel.send(entries || "You are not monitoring any accounts.");
+  }
+
+  if (command === "!stats") {
+    return targetChannel.send({ embeds: [buildStatsEmbed(message)] });
+  }
+
+  if (command === "!sesun") {
+    const hours = Math.max(1, Math.min(168, Number(args[0] || 24)));
+    return targetChannel.send({ embeds: [buildRecentUnbansEmbed(message, hours)] });
+  }
+});
+
 function startMonitorLoop() {
   setInterval(async () => {
     const entries = Object.entries(monitors);
@@ -1035,7 +1605,10 @@ function startMonitorLoop() {
 
             const channel = await client.channels.fetch(item.channelId);
 
-            await sendRecovered(channel, item.username, result, duration);
+            await sendRecovered(channel, item.username, result, duration, {
+              guildId: item.guildId,
+              userId: item.userId,
+            });
 
             item.lastStatus = "active";
             item.activeHits = 0;
