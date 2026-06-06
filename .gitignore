@@ -1,6 +1,7 @@
 .env
 node_modules
 screenshots
+data
 ig-session.json
 monitors.json
 monitors.json.tmp

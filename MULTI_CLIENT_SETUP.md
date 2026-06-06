@@ -48,3 +48,25 @@ Users can then run these commands inside their private room:
 ```
 
 If a user runs `!t username` in the public command channel, the bot will try to delete the public message and continue in that user's private room.
+
+## Hosting persistence
+
+The bot saves monitored accounts, server setup, and recent unbans as JSON files.
+Use persistent storage on your host so those files survive redeploys.
+
+Recommended environment variable:
+
+```text
+DATA_DIR=/data
+```
+
+On hosts such as Render, create a persistent disk and mount it at `/data`.
+The bot will then save:
+
+```text
+/data/monitors.json
+/data/guild-configs.json
+/data/recent-unbans.json
+```
+
+If `/data` exists, the bot uses it automatically. `DATA_DIR` is still recommended so the path is explicit.

@@ -28,9 +28,17 @@ const CHECK_EVERY_SECONDS = Number(process.env.CHECK_EVERY_SECONDS || 300);
 const CONCURRENT_CHECKS = Number(process.env.CONCURRENT_CHECKS || 1);
 const ACTIVE_CONFIRMATIONS = Number(process.env.ACTIVE_CONFIRMATIONS || 3);
 const BROWSER_RESTART_MINUTES = Number(process.env.BROWSER_RESTART_MINUTES || 30);
-const MONITORS_FILE = process.env.MONITORS_FILE || path.join(__dirname, "monitors.json");
-const GUILD_CONFIGS_FILE = process.env.GUILD_CONFIGS_FILE || path.join(__dirname, "guild-configs.json");
-const RECENT_UNBANS_FILE = process.env.RECENT_UNBANS_FILE || path.join(__dirname, "recent-unbans.json");
+
+function resolveDataDir() {
+  if (process.env.DATA_DIR) return path.resolve(process.env.DATA_DIR);
+  if (fs.existsSync("/data")) return "/data";
+  return __dirname;
+}
+
+const DATA_DIR = resolveDataDir();
+const MONITORS_FILE = process.env.MONITORS_FILE || path.join(DATA_DIR, "monitors.json");
+const GUILD_CONFIGS_FILE = process.env.GUILD_CONFIGS_FILE || path.join(DATA_DIR, "guild-configs.json");
+const RECENT_UNBANS_FILE = process.env.RECENT_UNBANS_FILE || path.join(DATA_DIR, "recent-unbans.json");
 
 const monitors = {};
 const guildConfigs = {};
@@ -1188,6 +1196,7 @@ async function sendUnavailable(channel, username, result) {
 
 client.once("ready", async () => {
   console.log(`Discord bot online: ${client.user.tag}`);
+  console.log(`Persistent data directory: ${DATA_DIR}`);
 
   loadMonitors();
   loadGuildConfigs();
