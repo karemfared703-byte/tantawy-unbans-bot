@@ -26,6 +26,7 @@ const CHECK_EVERY_SECONDS = Number(process.env.CHECK_EVERY_SECONDS || 300);
 const CONCURRENT_CHECKS = Number(process.env.CONCURRENT_CHECKS || 1);
 const ACTIVE_CONFIRMATIONS = Number(process.env.ACTIVE_CONFIRMATIONS || 3);
 const BROWSER_RESTART_MINUTES = Number(process.env.BROWSER_RESTART_MINUTES || 30);
+const MONITORS_FILE = process.env.MONITORS_FILE || path.join(__dirname, "monitors.json");
 
 const monitors = {};
 const queue = [];
@@ -70,6 +71,63 @@ function cleanupOldScreenshots() {
     }
   } catch (error) {
     console.log("Cleanup error:", error.message);
+  }
+}
+
+function normalizeMonitorRecord(key, item) {
+  if (!item || typeof item !== "object") return null;
+
+  const username = String(item.username || "").trim();
+  const userId = String(item.userId || "").trim();
+  const channelId = String(item.channelId || "").trim();
+
+  if (!username || !userId || !channelId) return null;
+
+  return {
+    username,
+    userId,
+    channelId,
+    lastStatus: item.lastStatus || "unknown",
+    startedAt: Number(item.startedAt || Date.now()),
+    bannedStartedAt: item.bannedStartedAt ? Number(item.bannedStartedAt) : null,
+    activeHits: Number(item.activeHits || 0),
+  };
+}
+
+function loadMonitors() {
+  try {
+    if (!fs.existsSync(MONITORS_FILE)) {
+      console.log(`No monitor store found at ${MONITORS_FILE}`);
+      return;
+    }
+
+    const saved = JSON.parse(fs.readFileSync(MONITORS_FILE, "utf8"));
+    let count = 0;
+
+    for (const [key, item] of Object.entries(saved)) {
+      const normalized = normalizeMonitorRecord(key, item);
+      if (!normalized) continue;
+
+      monitors[key] = normalized;
+      count++;
+    }
+
+    console.log(`Loaded ${count} monitor(s) from ${MONITORS_FILE}`);
+  } catch (error) {
+    console.log("Load monitors error:", error.message);
+  }
+}
+
+function saveMonitors() {
+  try {
+    const folder = path.dirname(MONITORS_FILE);
+    fs.mkdirSync(folder, { recursive: true });
+
+    const tmpPath = `${MONITORS_FILE}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(monitors, null, 2));
+    fs.renameSync(tmpPath, MONITORS_FILE);
+  } catch (error) {
+    console.log("Save monitors error:", error.message);
   }
 }
 
@@ -785,6 +843,8 @@ async function sendUnavailable(channel, username, result) {
 client.once("ready", async () => {
   console.log(`Discord bot online: ${client.user.tag}`);
 
+  loadMonitors();
+
   sharedBrowser = await launchBrowser();
 
   console.log(`Shared browser started. Concurrency: ${CONCURRENT_CHECKS}`);
@@ -844,6 +904,7 @@ client.on("messageCreate", async (message) => {
           delete monitors[key];
         }
       });
+      saveMonitors();
 
       return message.reply("🛑 Cancelled all your monitors.");
     }
@@ -856,6 +917,7 @@ client.on("messageCreate", async (message) => {
 
     if (monitors[key]) {
       delete monitors[key];
+      saveMonitors();
       return message.reply(`🛑 Cancelled monitoring @${username}`);
     }
 
@@ -917,6 +979,7 @@ client.on("messageCreate", async (message) => {
       bannedStartedAt: null,
       activeHits: 0,
     };
+    saveMonitors();
 
     return;
   }
@@ -930,6 +993,7 @@ client.on("messageCreate", async (message) => {
     bannedStartedAt: startedAt,
     activeHits: 0,
   };
+  saveMonitors();
 
   return sendUnavailable(dmChannel, username, result);
 });
@@ -953,12 +1017,14 @@ function startMonitorLoop() {
             result.status === "active"
           ) {
             item.activeHits = (item.activeHits || 0) + 1;
+            saveMonitors();
 
             console.log(
               `ACTIVE CONFIRMATION ${item.username}: ${item.activeHits}/${ACTIVE_CONFIRMATIONS}`
             );
 
             if (item.activeHits < ACTIVE_CONFIRMATIONS) {
+              saveMonitors();
               safeDelete(result.screenshot);
               return;
             }
@@ -974,6 +1040,7 @@ function startMonitorLoop() {
             item.lastStatus = "active";
             item.activeHits = 0;
             item.bannedStartedAt = null;
+            saveMonitors();
 
             return;
           }
@@ -987,6 +1054,7 @@ function startMonitorLoop() {
           }
 
           item.lastStatus = result.status;
+          saveMonitors();
 
           safeDelete(result.screenshot);
         })
