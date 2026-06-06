@@ -181,13 +181,13 @@ async function restartBrowser() {
 
 async function createPage(browser) {
   const options = {
-    viewport: { width: 1280, height: 720 },
-    isMobile: false,
-    hasTouch: false,
-    deviceScaleFactor: 1,
+    viewport: { width: 430, height: 932 },
+    isMobile: true,
+    hasTouch: true,
+    deviceScaleFactor: 3,
     colorScheme: "dark",
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
   };
 
   if (fs.existsSync("ig-session.json")) {
@@ -288,27 +288,49 @@ async function checkInstagram(username) {
       }
     }
 
-    try {
-      await page.evaluate(() => {
-        window.scrollTo(0, 0);
-        document.body.style.background = "#000";
-        document.documentElement.style.background = "#000";
-      });
-    } catch {}
+    // Wait for profile content to actually appear
+    await page.waitForFunction(
+      (u) => {
+        const t = document.body?.innerText?.toLowerCase() || "";
+        return t.includes(u) || t.includes("followers");
+      },
+      username.toLowerCase(),
+      { timeout: 12000 }
+    ).catch(() => {
+      console.log(`Profile wait timeout for @${username}, continuing`);
+    });
 
+    // Re-read body after content settles
+    bodyText = (await page.locator("body").innerText()).toLowerCase();
+    pageUrl = page.url().toLowerCase();
+
+    // Remove popups before screenshot
     await removePopups(page);
     await page.waitForTimeout(1000);
 
+    await page.evaluate(() => {
+      window.scrollTo(0, 0);
+      document.body.style.background = "#000";
+      document.documentElement.style.background = "#000";
+    }).catch(() => {});
+
+    await page.waitForTimeout(500);
+
     const rawScreenshot = `screenshots/raw-${Date.now()}-${username}.png`;
     const finalScreenshot = `screenshots/${Date.now()}-${username}.png`;
+
+    console.log(`SCREENSHOT CLIP: x=0, y=80, w=430, h=330`);
+    console.log(`FINAL URL: ${page.url()}`);
+    console.log(`PAGE TITLE: ${await page.title()}`);
+    console.log(`BODY TEXT: ${bodyText.slice(0, 500)}`);
 
     await page.screenshot({
       path: rawScreenshot,
       clip: {
         x: 0,
-        y: 0,
-        width: 1280,
-        height: 400,
+        y: 80,
+        width: 430,
+        height: 330,
       },
     });
 
