@@ -45,9 +45,50 @@ Users can then run these commands inside their private room:
 !clearall
 !stats
 !sesun 24
+!health
+!close
+!close 10m
 ```
 
 If a user runs `!t username` in the public command channel, the bot will try to delete the public message and continue in that user's private room.
+
+## Admin commands
+
+```text
+!setupname Pablo Unbans
+!setupbrand name Pablo Unbans
+!setupbrand color #ff0055
+!setupbrand logo https://example.com/logo.png
+!setupbrand roomprefix pablo-ticket
+!setupbrand welcome Welcome to your private support room.
+!setuplogs #bot-logs
+!setuprole @Customer
+!setupadminrole @Admin
+!setupcleanup 24
+!cleanup
+!pause
+!resume
+!license info
+!license set 30
+!license extend 15
+!license clear
+```
+
+## Dashboard
+
+Set a dashboard token:
+
+```text
+DASHBOARD_TOKEN=change_this_secret
+```
+
+Open:
+
+```text
+https://your-railway-domain/?token=change_this_secret
+```
+
+The dashboard shows bot status, sessions, private rooms, today stats, recent operations, monitored accounts, and lets you pause/resume servers, update branding, update channels/categories by ID, and manage license days.
 
 ## Hosting persistence
 

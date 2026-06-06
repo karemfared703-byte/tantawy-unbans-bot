@@ -7,11 +7,18 @@ const {
   EmbedBuilder,
   AttachmentBuilder,
   PermissionFlagsBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 
 const { chromium } = require("playwright");
 const sharp = require("sharp");
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
 
 const client = new Client({
@@ -28,6 +35,10 @@ const CHECK_EVERY_SECONDS = Number(process.env.CHECK_EVERY_SECONDS || 300);
 const CONCURRENT_CHECKS = Number(process.env.CONCURRENT_CHECKS || 1);
 const ACTIVE_CONFIRMATIONS = Number(process.env.ACTIVE_CONFIRMATIONS || 3);
 const BROWSER_RESTART_MINUTES = Number(process.env.BROWSER_RESTART_MINUTES || 30);
+const DASHBOARD_ENABLED = process.env.DASHBOARD_ENABLED !== "false";
+const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT || process.env.PORT || 3000);
+const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
+const STARTED_AT = Date.now();
 
 function resolveDataDir() {
   if (process.env.DATA_DIR) return path.resolve(process.env.DATA_DIR);
@@ -43,6 +54,7 @@ const RECENT_UNBANS_FILE = process.env.RECENT_UNBANS_FILE || path.join(DATA_DIR,
 const monitors = {};
 const guildConfigs = {};
 let recentUnbans = [];
+let operationLogs = [];
 const queue = [];
 
 let activeJobs = 0;
@@ -161,15 +173,29 @@ function getGuildConfig(guildId) {
     guildConfigs[guildId] = {
       guildId,
       botName: "",
+      embedColor: "#5865F2",
+      logoUrl: "",
+      welcomeMessage: "",
+      roomPrefix: "unban",
       commandChannelId: null,
       privateCategoryId: null,
+      logsChannelId: null,
+      allowedRoleId: null,
+      adminRoleId: null,
+      licenseExpiresAt: null,
+      cleanupHours: 24,
+      paused: false,
       rooms: {},
+      roomActivity: {},
+      roomCloseAt: {},
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
   }
 
   if (!guildConfigs[guildId].rooms) guildConfigs[guildId].rooms = {};
+  if (!guildConfigs[guildId].roomActivity) guildConfigs[guildId].roomActivity = {};
+  if (!guildConfigs[guildId].roomCloseAt) guildConfigs[guildId].roomCloseAt = {};
   return guildConfigs[guildId];
 }
 
@@ -188,9 +214,21 @@ function loadGuildConfigs() {
       guildConfigs[guildId] = {
         guildId,
         botName: String(config.botName || ""),
+        embedColor: String(config.embedColor || "#5865F2"),
+        logoUrl: String(config.logoUrl || ""),
+        welcomeMessage: String(config.welcomeMessage || ""),
+        roomPrefix: String(config.roomPrefix || "unban"),
         commandChannelId: config.commandChannelId || null,
         privateCategoryId: config.privateCategoryId || null,
+        logsChannelId: config.logsChannelId || null,
+        allowedRoleId: config.allowedRoleId || null,
+        adminRoleId: config.adminRoleId || null,
+        licenseExpiresAt: config.licenseExpiresAt ? Number(config.licenseExpiresAt) : null,
+        cleanupHours: Number(config.cleanupHours || 24),
+        paused: Boolean(config.paused),
         rooms: config.rooms && typeof config.rooms === "object" ? config.rooms : {},
+        roomActivity: config.roomActivity && typeof config.roomActivity === "object" ? config.roomActivity : {},
+        roomCloseAt: config.roomCloseAt && typeof config.roomCloseAt === "object" ? config.roomCloseAt : {},
         createdAt: Number(config.createdAt || Date.now()),
         updatedAt: Number(config.updatedAt || Date.now()),
       };
@@ -236,6 +274,102 @@ function saveRecentUnbans() {
 
 function monitorKey(guildId, userId, username) {
   return `${guildId}:${userId}:${username.toLowerCase()}`;
+}
+
+function parseColor(value, fallback = 0x5865f2) {
+  const text = String(value || "").trim().replace("#", "");
+  if (/^[0-9a-f]{6}$/i.test(text)) return Number.parseInt(text, 16);
+  return fallback;
+}
+
+function normalizeHexColor(value) {
+  const text = String(value || "").trim();
+  const cleaned = text.startsWith("#") ? text : `#${text}`;
+  return /^#[0-9a-f]{6}$/i.test(cleaned) ? cleaned.toUpperCase() : null;
+}
+
+function getEmbedColor(guildOrId) {
+  const guildId = typeof guildOrId === "string" ? guildOrId : guildOrId?.id;
+  const config = getGuildConfig(guildId);
+  return parseColor(config.embedColor);
+}
+
+function getLicenseStatus(guildId) {
+  const config = getGuildConfig(guildId);
+  if (!config.licenseExpiresAt) return { active: true, label: "Lifetime", daysLeft: null };
+
+  const msLeft = config.licenseExpiresAt - Date.now();
+  const daysLeft = Math.ceil(msLeft / (1000 * 60 * 60 * 24));
+  return {
+    active: msLeft > 0,
+    label: msLeft > 0 ? `${daysLeft} day(s) left` : `Expired ${Math.abs(daysLeft)} day(s) ago`,
+    daysLeft,
+  };
+}
+
+function hasRole(member, roleId) {
+  return Boolean(roleId && member?.roles?.cache?.has(roleId));
+}
+
+function canUseBot(member) {
+  if (!member?.guild) return false;
+  const config = getGuildConfig(member.guild.id);
+  if (isAdmin(member)) return true;
+  if (!config.allowedRoleId) return true;
+  return hasRole(member, config.allowedRoleId);
+}
+
+function addOperationLog(guildId, message, meta = {}) {
+  const entry = {
+    guildId,
+    message,
+    meta,
+    at: Date.now(),
+  };
+
+  operationLogs.push(entry);
+  operationLogs = operationLogs.slice(-300);
+  console.log(`[${guildId}] ${message}`);
+}
+
+async function sendGuildLog(guildId, message, meta = {}) {
+  addOperationLog(guildId, message, meta);
+
+  try {
+    const config = getGuildConfig(guildId);
+    if (!config.logsChannelId) return;
+
+    const channel = await client.channels.fetch(config.logsChannelId).catch(() => null);
+    if (!channel?.isTextBased?.()) return;
+
+    const details = Object.entries(meta)
+      .filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .map(([key, value]) => `**${key}:** ${value}`)
+      .join("\n");
+
+    const embed = new EmbedBuilder()
+      .setColor(getEmbedColor(guildId))
+      .setTitle("Bot Log")
+      .setDescription(details ? `${message}\n\n${details}` : message)
+      .setTimestamp(new Date());
+
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    console.log("Guild log error:", error.message);
+  }
+}
+
+function checkStorage() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const testPath = path.join(DATA_DIR, `.health-${process.pid}.tmp`);
+    fs.writeFileSync(testPath, "ok");
+    const ok = fs.readFileSync(testPath, "utf8") === "ok";
+    fs.unlinkSync(testPath);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 function isInstagramUrl(text) {
@@ -886,7 +1020,12 @@ async function checkInstagram(username) {
 }
 
 function isAdmin(member) {
-  return Boolean(member?.permissions?.has(PermissionFlagsBits.ManageGuild));
+  if (!member?.guild) return false;
+  const config = getGuildConfig(member.guild.id);
+  return Boolean(
+    member.permissions?.has(PermissionFlagsBits.ManageGuild) ||
+    hasRole(member, config.adminRoleId)
+  );
 }
 
 function sanitizeChannelName(value) {
@@ -904,6 +1043,15 @@ function getConfiguredBotName(guild) {
 
 function isUserRoom(config, userId, channelId) {
   return config.rooms?.[userId] === channelId;
+}
+
+function touchUserRoom(guildId, userId) {
+  const config = getGuildConfig(guildId);
+  if (!config.rooms?.[userId]) return;
+
+  config.roomActivity[userId] = Date.now();
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
 }
 
 function getUserMonitorEntries(guildId, userId) {
@@ -946,6 +1094,76 @@ function parseUsernames(input) {
   return usernames.slice(0, 10);
 }
 
+function parseDurationMs(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return 0;
+
+  const match = text.match(/^(\d+)(s|m|h|d)?$/);
+  if (!match) return null;
+
+  const amount = Number(match[1]);
+  const unit = match[2] || "m";
+  const multipliers = {
+    s: 1000,
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+    d: 24 * 60 * 60 * 1000,
+  };
+
+  return amount * multipliers[unit];
+}
+
+function getCommandButtons() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("bot:start").setLabel("Start").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("bot:list").setLabel("List").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("bot:stats").setLabel("Stats").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("bot:stop").setLabel("Stop").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("bot:clear").setLabel("Clear All").setStyle(ButtonStyle.Danger)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("bot:close").setLabel("Close Room").setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+function buildWelcomeEmbed(member) {
+  const config = getGuildConfig(member.guild.id);
+  const name = config.botName || getConfiguredBotName(member.guild);
+  const description = config.welcomeMessage ||
+    "Your private room is ready. Use the buttons below or type a command.";
+
+  const embed = new EmbedBuilder()
+    .setColor(getEmbedColor(member.guild.id))
+    .setTitle(`Welcome ${member.displayName || member.user.username}`)
+    .setDescription(
+      `${description}\n\n` +
+      "**Available Commands:**\n" +
+      "`!t username` - Start monitoring\n" +
+      "`!stop username` - Stop monitoring\n" +
+      "`!list` - Show your list\n" +
+      "`!stats` - Show stats\n" +
+      "`!sesun 24` - Recent unbans\n" +
+      "`!close` - Close this room"
+    )
+    .setFooter({ text: name });
+
+  if (config.logoUrl) embed.setThumbnail(config.logoUrl);
+  return embed;
+}
+
+async function sendWelcomeMessage(channel, member) {
+  try {
+    await channel.send({
+      embeds: [buildWelcomeEmbed(member)],
+      components: getCommandButtons(),
+    });
+  } catch (error) {
+    console.log("Welcome message error:", error.message);
+  }
+}
+
 async function applyServerBotName(message, name) {
   const config = getGuildConfig(message.guild.id);
   config.botName = name;
@@ -977,6 +1195,20 @@ function resolveTextChannel(message, args) {
   ) || message.channel;
 }
 
+function resolveRole(message, args) {
+  const mentioned = message.mentions.roles.first();
+  if (mentioned) return mentioned;
+
+  const raw = args.join(" ").trim().replace(/[<@&>]/g, "");
+  if (!raw) return null;
+  if (raw.toLowerCase() === "none" || raw.toLowerCase() === "clear") return { id: null, name: "none" };
+
+  const byId = message.guild.roles.cache.get(raw);
+  if (byId) return byId;
+
+  return message.guild.roles.cache.find((role) => role.name.toLowerCase() === raw.toLowerCase()) || null;
+}
+
 function resolveCategory(message, args) {
   const raw = args.join(" ").trim().replace(/[<#>]/g, "");
   if (!raw) return message.channel.parent || null;
@@ -1000,7 +1232,8 @@ async function ensureUserRoom(message) {
     if (existing) return existing;
   }
 
-  const name = `unban-${sanitizeChannelName(message.member?.displayName || message.author.username)}`;
+  const roomPrefix = sanitizeChannelName(config.roomPrefix || "unban");
+  const name = `${roomPrefix}-${sanitizeChannelName(message.member?.displayName || message.author.username)}`;
   const overwrites = [
     {
       id: guild.roles.everyone.id,
@@ -1039,15 +1272,82 @@ async function ensureUserRoom(message) {
   });
 
   config.rooms[message.author.id] = channel.id;
+  config.roomActivity[message.author.id] = Date.now();
+  delete config.roomCloseAt[message.author.id];
   config.updatedAt = Date.now();
   saveGuildConfigs();
+  await sendWelcomeMessage(channel, message.member);
+  await sendGuildLog(guild.id, "Private room opened", {
+    user: message.author.tag,
+    channel: `#${channel.name}`,
+  });
 
   return channel;
 }
 
+async function closeUserRoom(guild, userId, reason = "Closed") {
+  const config = getGuildConfig(guild.id);
+  const channelId = config.rooms?.[userId];
+  if (!channelId) return false;
+
+  const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+
+  delete config.rooms[userId];
+  delete config.roomActivity[userId];
+  delete config.roomCloseAt[userId];
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+
+  if (channel) {
+    await channel.delete(reason).catch((error) => console.log("Close room delete error:", error.message));
+  }
+
+  await sendGuildLog(guild.id, "Private room closed", { userId, reason });
+  return true;
+}
+
+async function cleanupInactiveRooms(guildId = null, force = false) {
+  const guildIds = guildId ? [guildId] : Object.keys(guildConfigs);
+  let closed = 0;
+
+  for (const id of guildIds) {
+    const guild = client.guilds.cache.get(id) || await client.guilds.fetch(id).catch(() => null);
+    if (!guild) continue;
+
+    const config = getGuildConfig(id);
+    const cleanupHours = Number(config.cleanupHours || 24);
+    if (!force && cleanupHours <= 0) continue;
+
+    const cutoff = Date.now() - cleanupHours * 60 * 60 * 1000;
+
+    for (const [userId, channelId] of Object.entries(config.rooms || {})) {
+      const hasActiveMonitors = getUserMonitorEntries(id, userId).length > 0;
+      const lastActive = Number(config.roomActivity?.[userId] || 0);
+      const closeAt = Number(config.roomCloseAt?.[userId] || 0);
+      const shouldClose =
+        !hasActiveMonitors &&
+        (
+          force ||
+          (closeAt && closeAt <= Date.now()) ||
+          (cleanupHours > 0 && lastActive > 0 && lastActive <= cutoff)
+        );
+
+      if (!shouldClose) continue;
+
+      await closeUserRoom(guild, userId, closeAt ? "Scheduled close" : "Inactive private room cleanup");
+      closed++;
+    }
+  }
+
+  return closed;
+}
+
 async function getUserCommandChannel(message) {
   const config = getGuildConfig(message.guild.id);
-  if (isUserRoom(config, message.author.id, message.channel.id)) return message.channel;
+  if (isUserRoom(config, message.author.id, message.channel.id)) {
+    touchUserRoom(message.guild.id, message.author.id);
+    return message.channel;
+  }
 
   if (config.commandChannelId && message.channel.id !== config.commandChannelId) {
     await message.reply(`Use <#${config.commandChannelId}> or your private room.`);
@@ -1070,7 +1370,7 @@ function buildHelpEmbed(guild) {
   const botName = getConfiguredBotName(guild);
 
   return new EmbedBuilder()
-    .setColor(0x5865f2)
+    .setColor(getEmbedColor(guild.id))
     .setTitle("ℹ️ Bot Commands")
     .setDescription("Commands to monitor Instagram accounts:")
     .addFields(
@@ -1081,7 +1381,9 @@ function buildHelpEmbed(guild) {
       { name: "!clearall", value: "Clear your list. (`!clearall`)" },
       { name: "!stats", value: "Show monitoring statistics. (`!stats`)" },
       { name: "!sesun", value: "Show recently unbanned accounts. (`!sesun <hours>`)" },
-      { name: "Admin setup", value: "`!setupname <name>`\n`!setupchannel [#channel]`\n`!setupcategory <category id/name>`\n`!setupinfo`" }
+      { name: "!close", value: "Close your private room now or later. (`!close [10m]`)" },
+      { name: "!health", value: "Show bot health and storage status. (`!health`)" },
+      { name: "Admin setup", value: "`!setupname <name>`\n`!setupchannel [#channel]`\n`!setupcategory <category>`\n`!setuplogs #bot-logs`\n`!setuprole @Role`\n`!setupadminrole @Role`\n`!setupcleanup 24`\n`!setupbrand color #ff0055`\n`!license info`" }
     )
     .setFooter({ text: botName });
 }
@@ -1096,15 +1398,17 @@ function buildStatsEmbed(message) {
   for (const item of guildEntries) {
     counts[item.lastStatus || "unknown"] = (counts[item.lastStatus || "unknown"] || 0) + 1;
   }
+  const license = getLicenseStatus(guildId);
 
   return new EmbedBuilder()
-    .setColor(0x2b2d31)
+    .setColor(getEmbedColor(guildId))
     .setTitle("📊 Bot Stats")
     .setDescription(
       `**Your monitored accounts:** ${userEntries.length}\n` +
       `**Server monitored accounts:** ${guildEntries.length}\n` +
       `**Active:** ${counts.active || 0}\n` +
-      `**Banned/Login/Unknown:** ${(counts.banned || 0) + (counts.login || 0) + (counts.unknown || 0)}`
+      `**Banned/Login/Unknown:** ${(counts.banned || 0) + (counts.login || 0) + (counts.unknown || 0)}\n` +
+      `**License:** ${license.label}`
     );
 }
 
@@ -1131,7 +1435,277 @@ function buildRecentUnbansEmbed(message, hours) {
     .setDescription(description);
 }
 
-function recoveredEmbed(username, result, duration) {
+function buildHealthEmbed(guild = null) {
+  const privateRooms = Object.values(guildConfigs)
+    .reduce((sum, config) => sum + Object.keys(config.rooms || {}).length, 0);
+  const uptime = formatDuration(Date.now() - STARTED_AT);
+  const storageOk = checkStorage();
+
+  const embed = new EmbedBuilder()
+    .setColor(storageOk ? 0x00ff44 : 0xff3333)
+    .setTitle("Health Check")
+    .setDescription(
+      `**Bot status:** Online\n` +
+      `**Data directory:** ${DATA_DIR}\n` +
+      `**Storage:** ${storageOk ? "OK" : "ERROR"}\n` +
+      `**Uptime:** ${uptime}\n` +
+      `**Servers:** ${client.guilds.cache.size}\n` +
+      `**Private rooms:** ${privateRooms}\n` +
+      `**Queue:** ${queue.length}\n` +
+      `**Active jobs:** ${activeJobs}`
+    );
+
+  if (guild) embed.setFooter({ text: getConfiguredBotName(guild) });
+  return embed;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function dashboardAuthorized(req, url) {
+  if (!DASHBOARD_TOKEN) return false;
+
+  const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  return bearer === DASHBOARD_TOKEN || url.searchParams.get("token") === DASHBOARD_TOKEN;
+}
+
+function dashboardTokenSuffix(url) {
+  const token = url.searchParams.get("token") || DASHBOARD_TOKEN;
+  return token ? `?token=${encodeURIComponent(token)}` : "";
+}
+
+function dashboardStats() {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const totalRooms = Object.values(guildConfigs)
+    .reduce((sum, config) => sum + Object.keys(config.rooms || {}).length, 0);
+  const todayUnbans = recentUnbans.filter((item) => item.at >= todayStart.getTime()).length;
+
+  return {
+    online: Boolean(client.user),
+    uptime: formatDuration(Date.now() - STARTED_AT),
+    servers: client.guilds.cache.size,
+    sessions: Object.keys(monitors).length,
+    rooms: totalRooms,
+    todayUnbans,
+    storageOk: checkStorage(),
+  };
+}
+
+function renderDashboard(url) {
+  if (!DASHBOARD_TOKEN) {
+    return `<!doctype html><html><body style="font-family:Arial;background:#111;color:#fff;padding:32px"><h1>Dashboard disabled</h1><p>Set <code>DASHBOARD_TOKEN</code> in Railway, then open <code>/?token=YOUR_TOKEN</code>.</p></body></html>`;
+  }
+
+  const tokenSuffix = dashboardTokenSuffix(url);
+  const stats = dashboardStats();
+  const guildCards = Object.entries(guildConfigs).map(([guildId, config]) => {
+    const guild = client.guilds.cache.get(guildId);
+    const guildMonitors = Object.values(monitors).filter((item) => item.guildId === guildId);
+    const license = getLicenseStatus(guildId);
+    const recentOps = operationLogs
+      .filter((item) => item.guildId === guildId)
+      .slice(-6)
+      .reverse()
+      .map((item) => `<li>${escapeHtml(new Date(item.at).toLocaleString())} - ${escapeHtml(item.message)}</li>`)
+      .join("");
+
+    return `
+      <section class="card">
+        <div class="row">
+          <h2>${escapeHtml(guild?.name || guildId)}</h2>
+          <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/pause${tokenSuffix}">
+            <input type="hidden" name="paused" value="${config.paused ? "false" : "true"}">
+            <button>${config.paused ? "Resume" : "Pause"}</button>
+          </form>
+        </div>
+        <p><b>License:</b> ${escapeHtml(license.label)} | <b>Sessions:</b> ${guildMonitors.length} | <b>Rooms:</b> ${Object.keys(config.rooms || {}).length}</p>
+        <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/config${tokenSuffix}" class="grid">
+          <label>Bot name <input name="botName" value="${escapeHtml(config.botName)}"></label>
+          <label>Embed color <input name="embedColor" value="${escapeHtml(config.embedColor)}"></label>
+          <label>Logo URL <input name="logoUrl" value="${escapeHtml(config.logoUrl)}"></label>
+          <label>Room prefix <input name="roomPrefix" value="${escapeHtml(config.roomPrefix)}"></label>
+          <label>Command channel ID <input name="commandChannelId" value="${escapeHtml(config.commandChannelId || "")}"></label>
+          <label>Private category ID <input name="privateCategoryId" value="${escapeHtml(config.privateCategoryId || "")}"></label>
+          <label>Logs channel ID <input name="logsChannelId" value="${escapeHtml(config.logsChannelId || "")}"></label>
+          <label>Allowed role ID <input name="allowedRoleId" value="${escapeHtml(config.allowedRoleId || "")}"></label>
+          <label>Admin role ID <input name="adminRoleId" value="${escapeHtml(config.adminRoleId || "")}"></label>
+          <label>Cleanup hours <input name="cleanupHours" type="number" min="0" max="720" value="${escapeHtml(config.cleanupHours || 24)}"></label>
+          <label class="wide">Welcome message <input name="welcomeMessage" value="${escapeHtml(config.welcomeMessage)}"></label>
+          <button class="wide">Save config</button>
+        </form>
+        <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/license${tokenSuffix}" class="inline">
+          <input name="days" type="number" min="1" max="3650" placeholder="30">
+          <button name="action" value="set">Set license days</button>
+          <button name="action" value="extend">Extend</button>
+          <button name="action" value="clear">Lifetime</button>
+        </form>
+        <h3>Monitored accounts</h3>
+        <p>${guildMonitors.slice(0, 20).map((item) => `@${escapeHtml(item.username)} (${escapeHtml(item.lastStatus)})`).join(", ") || "None"}</p>
+        <h3>Last operations</h3>
+        <ul>${recentOps || "<li>No operations yet.</li>"}</ul>
+      </section>
+    `;
+  }).join("");
+
+  const recentRows = recentUnbans.slice(-10).reverse().map((item) =>
+    `<tr><td>${escapeHtml(item.username)}</td><td>${escapeHtml(item.followers)}</td><td>${escapeHtml(new Date(item.at).toLocaleString())}</td></tr>`
+  ).join("");
+
+  return `<!doctype html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Unbans Bot Dashboard</title>
+    <style>
+      body{font-family:Inter,Arial,sans-serif;background:#0f1117;color:#f4f5f7;margin:0;padding:28px}
+      h1,h2,h3{margin:0 0 12px}
+      .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0}
+      .stat,.card{background:#181b24;border:1px solid #2a2f3d;border-radius:10px;padding:16px}
+      .stat b{display:block;font-size:28px;margin-top:8px}
+      .card{margin:18px 0}
+      .row{display:flex;justify-content:space-between;gap:12px;align-items:center}
+      .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+      .wide{grid-column:1/-1}
+      input{width:100%;box-sizing:border-box;background:#10131b;color:#fff;border:1px solid #30384a;border-radius:6px;padding:9px;margin-top:5px}
+      button{background:#7c3aed;color:white;border:0;border-radius:7px;padding:9px 12px;cursor:pointer}
+      .inline{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.inline input{width:120px}
+      table{width:100%;border-collapse:collapse}.muted{color:#9aa3b2}td,th{border-bottom:1px solid #272d3a;padding:8px;text-align:left}
+    </style>
+  </head>
+  <body>
+    <h1>Unbans Bot Dashboard</h1>
+    <p class="muted">Status: ${stats.online ? "Online" : "Offline"} | Uptime: ${escapeHtml(stats.uptime)} | Data: ${escapeHtml(DATA_DIR)}</p>
+    <div class="stats">
+      <div class="stat">Servers <b>${stats.servers}</b></div>
+      <div class="stat">Sessions <b>${stats.sessions}</b></div>
+      <div class="stat">Private rooms <b>${stats.rooms}</b></div>
+      <div class="stat">Today unbans <b>${stats.todayUnbans}</b></div>
+      <div class="stat">Storage <b>${stats.storageOk ? "OK" : "ERR"}</b></div>
+    </div>
+    ${guildCards || "<p>No server configs yet. Run setup commands in Discord first.</p>"}
+    <section class="card"><h2>Recent Unbans</h2><table><tr><th>Username</th><th>Followers</th><th>When</th></tr>${recentRows}</table></section>
+  </body></html>`;
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 100000) req.destroy();
+    });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+async function handleDashboardPost(req, res, url) {
+  const match = url.pathname.match(/^\/dashboard\/guild\/([^/]+)\/([^/]+)$/);
+  if (!match) {
+    res.writeHead(404);
+    return res.end("Not found");
+  }
+
+  const guildId = decodeURIComponent(match[1]);
+  const action = match[2];
+  const config = getGuildConfig(guildId);
+  const body = new URLSearchParams(await readRequestBody(req));
+
+  if (action === "pause") {
+    config.paused = body.get("paused") === "true";
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+  }
+
+  if (action === "config") {
+    config.botName = body.get("botName") || "";
+    config.logoUrl = body.get("logoUrl") || "";
+    config.welcomeMessage = (body.get("welcomeMessage") || "").slice(0, 500);
+    config.roomPrefix = sanitizeChannelName(body.get("roomPrefix") || "unban");
+    config.commandChannelId = body.get("commandChannelId") || null;
+    config.privateCategoryId = body.get("privateCategoryId") || null;
+    config.logsChannelId = body.get("logsChannelId") || null;
+    config.allowedRoleId = body.get("allowedRoleId") || null;
+    config.adminRoleId = body.get("adminRoleId") || null;
+    config.cleanupHours = Math.max(0, Math.min(720, Number(body.get("cleanupHours") || 24)));
+    const color = normalizeHexColor(body.get("embedColor") || "");
+    if (color) config.embedColor = color;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+
+    if (config.botName) {
+      const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+      let me = guild?.members?.me || null;
+      if (!me && guild?.members?.fetchMe) me = await guild.members.fetchMe().catch(() => null);
+      if (me) await me.setNickname(config.botName).catch(() => {});
+    }
+  }
+
+  if (action === "license") {
+    const licenseAction = body.get("action");
+    const days = Math.max(1, Math.min(3650, Number(body.get("days") || 30)));
+
+    if (licenseAction === "clear") config.licenseExpiresAt = null;
+    if (licenseAction === "set") config.licenseExpiresAt = Date.now() + days * 24 * 60 * 60 * 1000;
+    if (licenseAction === "extend") {
+      const base = config.licenseExpiresAt && config.licenseExpiresAt > Date.now() ? config.licenseExpiresAt : Date.now();
+      config.licenseExpiresAt = base + days * 24 * 60 * 60 * 1000;
+    }
+
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+  }
+
+  res.writeHead(303, { Location: `/${dashboardTokenSuffix(url)}` });
+  res.end();
+}
+
+function startDashboard() {
+  if (!DASHBOARD_ENABLED) return;
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    if (url.pathname === "/health") {
+      res.writeHead(checkStorage() ? 200 : 500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: checkStorage(), dataDir: DATA_DIR, uptime: Date.now() - STARTED_AT }));
+    }
+
+    if (!dashboardAuthorized(req, url)) {
+      res.writeHead(DASHBOARD_TOKEN ? 401 : 200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(DASHBOARD_TOKEN ? "Unauthorized" : renderDashboard(url));
+    }
+
+    if (req.method === "POST") return handleDashboardPost(req, res, url);
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(renderDashboard(url));
+  });
+
+  server.listen(DASHBOARD_PORT, () => {
+    console.log(`Dashboard listening on port ${DASHBOARD_PORT}`);
+    if (!DASHBOARD_TOKEN) console.log("Dashboard is disabled until DASHBOARD_TOKEN is set.");
+  });
+}
+
+function applyEmbedBranding(embed, guildId) {
+  if (!guildId) return embed;
+
+  const config = getGuildConfig(guildId);
+  embed.setColor(getEmbedColor(guildId));
+  if (config.logoUrl) embed.setThumbnail(config.logoUrl);
+  return embed;
+}
+
+function recoveredEmbed(username, result, duration, guildId = null) {
   const attachment = new AttachmentBuilder(result.screenshot, {
     name: "profile.png",
   });
@@ -1147,6 +1721,7 @@ function recoveredEmbed(username, result, duration) {
     .setFooter({
       text: `Unbanned at ${getTime()}`,
     });
+  applyEmbedBranding(embed, guildId);
 
   return {
     embeds: [embed],
@@ -1154,7 +1729,7 @@ function recoveredEmbed(username, result, duration) {
   };
 }
 
-function unavailableEmbed(username, result) {
+function unavailableEmbed(username, result, guildId = null) {
   const embed = new EmbedBuilder()
     .setColor(0xff3333)
     .setTitle(`Account Unavailable | @${username} 🚫`)
@@ -1164,6 +1739,7 @@ function unavailableEmbed(username, result) {
     .setFooter({
       text: `Monitoring started at ${getTime()}`,
     });
+  applyEmbedBranding(embed, guildId);
 
   const payload = {
     embeds: [embed],
@@ -1182,16 +1758,112 @@ function unavailableEmbed(username, result) {
 }
 
 async function sendRecovered(channel, username, result, duration, meta = null) {
-  const payload = recoveredEmbed(username, result, duration);
+  const payload = recoveredEmbed(username, result, duration, meta?.guildId);
   await channel.send(payload);
   recordRecentUnban(meta, username, result, duration);
   safeDelete(result.screenshot);
 }
 
-async function sendUnavailable(channel, username, result) {
-  const payload = unavailableEmbed(username, result);
+async function sendUnavailable(channel, username, result, meta = null) {
+  const payload = unavailableEmbed(username, result, meta?.guildId);
   await channel.send(payload);
   safeDelete(result.screenshot);
+}
+
+async function startMonitoringUsernames(context, usernames) {
+  const { guildId, userId, channel } = context;
+
+  if (!usernames.length) {
+    await channel.send("Use: `!t <username1> [username2] ...`");
+    return;
+  }
+
+  await channel.send(`Checking ${usernames.map((u) => `@${u}`).join(", ")}...`);
+
+  for (const username of usernames) {
+    const key = monitorKey(guildId, userId, username);
+    if (monitors[key]) {
+      await channel.send(`Already monitoring @${username}.`);
+      continue;
+    }
+
+    const startedAt = Date.now();
+    const result = await enqueueCheck(username);
+    const duration = formatDuration(Date.now() - startedAt);
+
+    if (result.status === "error") {
+      await channel.send(`Error checking @${username}\n\`${result.error}\``);
+      await sendGuildLog(guildId, "Instagram check error", { username, error: result.error });
+      continue;
+    }
+
+    const monitorRecord = {
+      username,
+      guildId,
+      userId,
+      channelId: channel.id,
+      lastStatus: result.status === "active" ? "active" : result.status,
+      startedAt,
+      bannedStartedAt: result.status === "active" ? null : startedAt,
+      activeHits: 0,
+    };
+
+    monitors[key] = monitorRecord;
+    saveMonitors();
+
+    if (result.status === "active") {
+      await sendRecovered(channel, username, result, duration, { guildId, userId });
+    } else {
+      await sendUnavailable(channel, username, result, { guildId, userId });
+    }
+
+    await sendGuildLog(guildId, "Monitoring started", {
+      userId,
+      username,
+      status: result.status,
+      channel: channel.id,
+    });
+  }
+}
+
+async function stopMonitoringUsername(context, username) {
+  const { guildId, userId, channel } = context;
+  const key = monitorKey(guildId, userId, username);
+
+  if (!monitors[key]) {
+    await channel.send(`You are not monitoring @${username}.`);
+    return;
+  }
+
+  delete monitors[key];
+  saveMonitors();
+  await channel.send(`Stopped monitoring @${username}.`);
+  await sendGuildLog(guildId, "Monitoring stopped", { userId, username });
+}
+
+async function clearUserMonitoring(context) {
+  const { guildId, userId, channel } = context;
+  let removed = 0;
+
+  for (const [key, item] of Object.entries(monitors)) {
+    if (item.guildId === guildId && item.userId === userId) {
+      delete monitors[key];
+      removed++;
+    }
+  }
+
+  saveMonitors();
+  await channel.send(`Cleared ${removed} monitored account(s).`);
+  await sendGuildLog(guildId, "Monitoring list cleared", { userId, removed });
+}
+
+async function sendUserMonitorList(context) {
+  const { guildId, userId, channel } = context;
+  const entries = getUserMonitorEntries(guildId, userId)
+    .map(([, item]) => `â€¢ @${item.username} â€” ${item.lastStatus}`)
+    .join("\n");
+
+  await channel.send(entries || "You are not monitoring any accounts.");
 }
 
 client.once("ready", async () => {
@@ -1201,6 +1873,7 @@ client.once("ready", async () => {
   loadMonitors();
   loadGuildConfigs();
   loadRecentUnbans();
+  startDashboard();
 
   sharedBrowser = await launchBrowser();
 
@@ -1208,6 +1881,9 @@ client.once("ready", async () => {
 
   setInterval(restartBrowser, 1000 * 60 * BROWSER_RESTART_MINUTES);
   setInterval(cleanupOldScreenshots, 1000 * 60 * 5);
+  setInterval(() => cleanupInactiveRooms().catch((error) => {
+    console.log("Room cleanup error:", error.message);
+  }), 1000 * 60 * 15);
 
   startMonitorLoop();
 });
@@ -1420,16 +2096,152 @@ client.on("messageCreate", async (message) => {
     );
   }
 
+  if (command === "!setuplogs") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const channel = resolveTextChannel(message, args);
+    config.logsChannelId = channel.id;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    await sendGuildLog(guildId, "Logs channel configured", { channel: `#${channel.name}` });
+    return message.reply(`Logs channel set to ${channel}.`);
+  }
+
+  if (command === "!setuprole") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const role = resolveRole(message, args);
+    if (!role) return message.reply("Use: `!setuprole @Customer` or `!setuprole none`.");
+
+    config.allowedRoleId = role.id;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(role.id ? `Allowed user role set to **${role.name}**.` : "Allowed user role cleared. Everyone can use the bot.");
+  }
+
+  if (command === "!setupadminrole") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const role = resolveRole(message, args);
+    if (!role) return message.reply("Use: `!setupadminrole @Admin` or `!setupadminrole none`.");
+
+    config.adminRoleId = role.id;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(role.id ? `Admin role set to **${role.name}**.` : "Admin role cleared. Manage Server still works.");
+  }
+
+  if (command === "!setupcleanup") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const hours = Math.max(0, Math.min(720, Number(args[0] || 24)));
+    config.cleanupHours = hours;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(hours ? `Auto cleanup set to ${hours} hour(s).` : "Auto cleanup disabled.");
+  }
+
+  if (command === "!cleanup") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const closed = await cleanupInactiveRooms(guildId, true);
+    return message.reply(`Closed ${closed} inactive private room(s).`);
+  }
+
+  if (command === "!pause" || command === "!resume") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    config.paused = command === "!pause";
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    await sendGuildLog(guildId, config.paused ? "Bot paused" : "Bot resumed", { by: message.author.tag });
+    return message.reply(config.paused ? "Bot is paused for new monitoring sessions." : "Bot resumed.");
+  }
+
+  if (command === "!license") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use license commands.");
+
+    const action = (args.shift() || "info").toLowerCase();
+    if (action === "info") {
+      const license = getLicenseStatus(guildId);
+      return message.reply(`License: **${license.label}**`);
+    }
+
+    if (action === "set" || action === "extend") {
+      const days = Math.max(1, Math.min(3650, Number(args[0] || 30)));
+      const base = action === "extend" && config.licenseExpiresAt && config.licenseExpiresAt > Date.now()
+        ? config.licenseExpiresAt
+        : Date.now();
+      config.licenseExpiresAt = base + days * 24 * 60 * 60 * 1000;
+      config.updatedAt = Date.now();
+      saveGuildConfigs();
+      await sendGuildLog(guildId, "License updated", { action, days, expiresAt: new Date(config.licenseExpiresAt).toISOString() });
+      return message.reply(`License ${action === "extend" ? "extended" : "set"} for ${days} day(s).`);
+    }
+
+    if (action === "clear" || action === "lifetime") {
+      config.licenseExpiresAt = null;
+      config.updatedAt = Date.now();
+      saveGuildConfigs();
+      return message.reply("License set to Lifetime.");
+    }
+
+    return message.reply("Use: `!license info`, `!license set 30`, `!license extend 15`, `!license clear`.");
+  }
+
+  if (command === "!setupbrand") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+
+    const field = (args.shift() || "").toLowerCase();
+    const value = args.join(" ").trim();
+
+    if (field === "name") {
+      if (value.length < 2 || value.length > 32) return message.reply("Use: `!setupbrand name Pablo Unbans`.");
+      await applyServerBotName(message, value);
+      return message.reply(`Brand name set to **${value}**.`);
+    }
+
+    if (field === "color") {
+      const color = normalizeHexColor(value);
+      if (!color) return message.reply("Use a hex color like `#ff0055`.");
+      config.embedColor = color;
+    } else if (field === "logo") {
+      if (value && !/^https?:\/\//i.test(value)) return message.reply("Logo must be a URL.");
+      config.logoUrl = value;
+    } else if (field === "roomprefix") {
+      const prefix = sanitizeChannelName(value);
+      if (!prefix) return message.reply("Use: `!setupbrand roomprefix pablo-ticket`.");
+      config.roomPrefix = prefix;
+    } else if (field === "welcome") {
+      config.welcomeMessage = value.slice(0, 500);
+    } else {
+      return message.reply("Use: `!setupbrand name|color|logo|roomprefix|welcome <value>`.");
+    }
+
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    await sendGuildLog(guildId, "Branding updated", { field });
+    return message.reply(`Brand ${field} updated.`);
+  }
+
   if (command === "!setupinfo") {
     if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
 
     const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
+      .setColor(getEmbedColor(guildId))
       .setTitle("Server Bot Setup")
       .setDescription(
         `**Bot name:** ${config.botName || getConfiguredBotName(message.guild)}\n` +
+        `**Embed color:** ${config.embedColor || "#5865F2"}\n` +
+        `**Room prefix:** ${config.roomPrefix || "unban"}\n` +
         `**Command lobby:** ${config.commandChannelId ? `<#${config.commandChannelId}>` : "Not set"}\n` +
         `**Private category:** ${config.privateCategoryId ? `<#${config.privateCategoryId}>` : "Not set"}\n` +
+        `**Logs channel:** ${config.logsChannelId ? `<#${config.logsChannelId}>` : "Not set"}\n` +
+        `**Allowed role:** ${config.allowedRoleId ? `<@&${config.allowedRoleId}>` : "Everyone"}\n` +
+        `**Admin role:** ${config.adminRoleId ? `<@&${config.adminRoleId}>` : "Manage Server"}\n` +
+        `**License:** ${getLicenseStatus(guildId).label}\n` +
+        `**Paused:** ${config.paused ? "Yes" : "No"}\n` +
+        `**Auto cleanup:** ${config.cleanupHours || 0}h\n` +
         `**Private rooms:** ${Object.keys(config.rooms || {}).length}`
       );
 
@@ -1437,8 +2249,12 @@ client.on("messageCreate", async (message) => {
   }
 
   if (command === "!chat") {
+    if (!canUseBot(message.member)) return message.reply("You do not have permission to use this bot.");
+    if (!getLicenseStatus(guildId).active) return message.reply("This server license has expired. Contact support.");
+
     try {
       const room = await ensureUserRoom(message);
+      touchUserRoom(guildId, userId);
       return message.reply(`Your private bot room is ${room}.`);
     } catch (error) {
       console.log("Create private room error:", error.message);
@@ -1448,10 +2264,22 @@ client.on("messageCreate", async (message) => {
 
   const monitorCommands = new Set(["!t", "!unban"]);
   const stopCommands = new Set(["!stop", "!cancel"]);
-  const userCommands = new Set(["!list", "!clearall", "!stats", "!sesun"]);
+  const userCommands = new Set(["!list", "!clearall", "!stats", "!sesun", "!close", "!health"]);
 
   if (!monitorCommands.has(command) && !stopCommands.has(command) && !userCommands.has(command)) {
     return;
+  }
+
+  if (!canUseBot(message.member)) {
+    return message.reply("You do not have permission to use this bot.");
+  }
+
+  if (!getLicenseStatus(guildId).active && command !== "!health") {
+    return message.reply("This server license has expired. Contact support.");
+  }
+
+  if (config.paused && monitorCommands.has(command)) {
+    return message.reply("Bot is paused for new monitoring sessions.");
   }
 
   let targetChannel;
@@ -1466,97 +2294,22 @@ client.on("messageCreate", async (message) => {
 
   if (monitorCommands.has(command)) {
     const usernames = parseUsernames(args.join(" "));
-    if (!usernames.length) {
-      return targetChannel.send("Use: `!t <username1> [username2] ...`");
-    }
-
-    await targetChannel.send(`Checking ${usernames.map((u) => `@${u}`).join(", ")}...`);
-
-    for (const username of usernames) {
-      const key = monitorKey(guildId, userId, username);
-      if (monitors[key]) {
-        await targetChannel.send(`Already monitoring @${username}.`);
-        continue;
-      }
-
-      const startedAt = Date.now();
-      const result = await enqueueCheck(username);
-      const duration = formatDuration(Date.now() - startedAt);
-
-      if (result.status === "error") {
-        await targetChannel.send(`Error checking @${username}\n\`${result.error}\``);
-        continue;
-      }
-
-      if (result.status === "active") {
-        await sendRecovered(targetChannel, username, result, duration, { guildId, userId });
-
-        monitors[key] = {
-          username,
-          guildId,
-          userId,
-          channelId: targetChannel.id,
-          lastStatus: "active",
-          startedAt,
-          bannedStartedAt: null,
-          activeHits: 0,
-        };
-        saveMonitors();
-        continue;
-      }
-
-      monitors[key] = {
-        username,
-        guildId,
-        userId,
-        channelId: targetChannel.id,
-        lastStatus: result.status,
-        startedAt,
-        bannedStartedAt: startedAt,
-        activeHits: 0,
-      };
-      saveMonitors();
-
-      await sendUnavailable(targetChannel, username, result);
-    }
-
+    await startMonitoringUsernames({ guildId, userId, channel: targetChannel }, usernames);
     return;
   }
 
   if (stopCommands.has(command)) {
     if (args[0]?.toLowerCase() === "all") {
-      let removed = 0;
-      for (const [key, item] of Object.entries(monitors)) {
-        if (item.guildId === guildId && item.userId === userId) {
-          delete monitors[key];
-          removed++;
-        }
-      }
-      saveMonitors();
-      return targetChannel.send(`Stopped monitoring ${removed} account(s).`);
+      return clearUserMonitoring({ guildId, userId, channel: targetChannel });
     }
 
     const username = getUsername(args[0] || "");
     if (!username) return targetChannel.send("Use: `!stop <username>`");
-
-    const key = monitorKey(guildId, userId, username);
-    if (!monitors[key]) return targetChannel.send(`You are not monitoring @${username}.`);
-
-    delete monitors[key];
-    saveMonitors();
-    return targetChannel.send(`Stopped monitoring @${username}.`);
+    return stopMonitoringUsername({ guildId, userId, channel: targetChannel }, username);
   }
 
   if (command === "!clearall") {
-    let removed = 0;
-    for (const [key, item] of Object.entries(monitors)) {
-      if (item.guildId === guildId && item.userId === userId) {
-        delete monitors[key];
-        removed++;
-      }
-    }
-    saveMonitors();
-    return targetChannel.send(`Cleared ${removed} monitored account(s).`);
+    return clearUserMonitoring({ guildId, userId, channel: targetChannel });
   }
 
   if (command === "!list") {
@@ -1571,9 +2324,146 @@ client.on("messageCreate", async (message) => {
     return targetChannel.send({ embeds: [buildStatsEmbed(message)] });
   }
 
+  if (command === "!health") {
+    return targetChannel.send({ embeds: [buildHealthEmbed(message.guild)] });
+  }
+
+  if (command === "!close") {
+    const active = getUserMonitorEntries(guildId, userId).length;
+    if (active > 0) {
+      return targetChannel.send("You still have monitored accounts. Use `!clearall` before closing this room.");
+    }
+
+    const delay = parseDurationMs(args[0] || "");
+    if (delay === null) return targetChannel.send("Use: `!close` or `!close 10m`.");
+
+    if (delay > 0) {
+      config.roomCloseAt[userId] = Date.now() + delay;
+      config.updatedAt = Date.now();
+      saveGuildConfigs();
+      await sendGuildLog(guildId, "Private room close scheduled", { userId, delay: args[0] });
+      return targetChannel.send(`This room will close in ${args[0]}.`);
+    }
+
+    await targetChannel.send("Closing this room...");
+    setTimeout(() => closeUserRoom(message.guild, userId, "User requested close"), 1500);
+    return;
+  }
+
   if (command === "!sesun") {
     const hours = Math.max(1, Math.min(168, Number(args[0] || 24)));
     return targetChannel.send({ embeds: [buildRecentUnbansEmbed(message, hours)] });
+  }
+});
+
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.guild || !interaction.member || interaction.user.bot) return;
+
+    const guildId = interaction.guild.id;
+    const userId = interaction.user.id;
+    const config = getGuildConfig(guildId);
+    const context = { guildId, userId, channel: interaction.channel };
+
+    if (!interaction.isButton() && !interaction.isModalSubmit()) return;
+
+    if (!isUserRoom(config, userId, interaction.channelId)) {
+      return interaction.reply({ content: "Use these controls inside your private room.", ephemeral: true });
+    }
+
+    touchUserRoom(guildId, userId);
+
+    if (!canUseBot(interaction.member)) {
+      return interaction.reply({ content: "You do not have permission to use this bot.", ephemeral: true });
+    }
+
+    if (!getLicenseStatus(guildId).active) {
+      return interaction.reply({ content: "This server license has expired. Contact support.", ephemeral: true });
+    }
+
+    if (interaction.isButton()) {
+      if (interaction.customId === "bot:start") {
+        if (config.paused) return interaction.reply({ content: "Bot is paused for new monitoring sessions.", ephemeral: true });
+
+        const modal = new ModalBuilder()
+          .setCustomId("bot:start:modal")
+          .setTitle("Start Monitoring");
+        const input = new TextInputBuilder()
+          .setCustomId("usernames")
+          .setLabel("Instagram usernames")
+          .setPlaceholder("username1 username2")
+          .setRequired(true)
+          .setStyle(TextInputStyle.Paragraph);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
+
+      if (interaction.customId === "bot:stop") {
+        const modal = new ModalBuilder()
+          .setCustomId("bot:stop:modal")
+          .setTitle("Stop Monitoring");
+        const input = new TextInputBuilder()
+          .setCustomId("username")
+          .setLabel("Instagram username")
+          .setRequired(true)
+          .setStyle(TextInputStyle.Short);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+
+      if (interaction.customId === "bot:list") {
+        await sendUserMonitorList(context);
+        return interaction.editReply("List sent.");
+      }
+
+      if (interaction.customId === "bot:stats") {
+        await interaction.channel.send({ embeds: [buildStatsEmbed({ guild: interaction.guild, author: interaction.user, member: interaction.member })] });
+        return interaction.editReply("Stats sent.");
+      }
+
+      if (interaction.customId === "bot:clear") {
+        await clearUserMonitoring(context);
+        return interaction.editReply("List cleared.");
+      }
+
+      if (interaction.customId === "bot:close") {
+        const active = getUserMonitorEntries(guildId, userId).length;
+        if (active > 0) return interaction.editReply("Clear your monitored accounts before closing this room.");
+
+        await interaction.channel.send("Closing this room...");
+        setTimeout(() => closeUserRoom(interaction.guild, userId, "User clicked close"), 1500);
+        return interaction.editReply("Closing.");
+      }
+
+      return interaction.editReply("Unknown button.");
+    }
+
+    if (interaction.isModalSubmit()) {
+      await interaction.deferReply({ ephemeral: true });
+
+      if (interaction.customId === "bot:start:modal") {
+        if (config.paused) return interaction.editReply("Bot is paused for new monitoring sessions.");
+
+        const usernames = parseUsernames(interaction.fields.getTextInputValue("usernames"));
+        await startMonitoringUsernames(context, usernames);
+        return interaction.editReply("Monitoring request sent.");
+      }
+
+      if (interaction.customId === "bot:stop:modal") {
+        const username = getUsername(interaction.fields.getTextInputValue("username"));
+        if (!username) return interaction.editReply("Invalid username.");
+
+        await stopMonitoringUsername(context, username);
+        return interaction.editReply("Stop request sent.");
+      }
+    }
+  } catch (error) {
+    console.log("Interaction error:", error.message);
+    if (interaction.isRepliable?.() && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: "Something went wrong.", ephemeral: true }).catch(() => {});
+    }
   }
 });
 
