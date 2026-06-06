@@ -181,13 +181,13 @@ async function restartBrowser() {
 
 async function createPage(browser) {
   const options = {
-    viewport: { width: 430, height: 932 },
-    isMobile: true,
-    hasTouch: true,
-    deviceScaleFactor: 3,
+    viewport: { width: 1280, height: 720 },
+    isMobile: false,
+    hasTouch: false,
+    deviceScaleFactor: 1,
     colorScheme: "dark",
     userAgent:
-      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
   };
 
   if (fs.existsSync("ig-session.json")) {
@@ -210,20 +210,6 @@ async function removePopups(page) {
         .querySelectorAll('div[role="dialog"]')
         .forEach((el) => el.remove());
 
-      document.querySelectorAll("*").forEach((el) => {
-        const style = window.getComputedStyle(el);
-        const bg = style.backgroundColor || "";
-
-        if (
-          (style.position === "fixed" || style.position === "sticky") &&
-          (bg.includes("rgba") || bg.includes("rgb(0"))
-        ) {
-          el.remove();
-        }
-      });
-
-      document.body.style.filter = "none";
-      document.documentElement.style.filter = "none";
       document.body.style.background = "#000";
       document.documentElement.style.background = "#000";
     });
@@ -246,6 +232,16 @@ async function roundImage(inputPath, outputPath) {
     .toFile(outputPath);
 }
 
+const INSTA_ERROR_PHRASES = [
+  "something went wrong",
+  "there's an issue",
+  "could not be loaded",
+  "reload page",
+  "page could not be loaded",
+  "please try again",
+  "we're working on it",
+];
+
 async function checkInstagram(username) {
   let context = null;
   let page = null;
@@ -259,30 +255,49 @@ async function checkInstagram(username) {
     context = created.context;
     page = created.page;
 
-    await page.goto(url, {
-      waitUntil: "networkidle",
-      timeout: 30000,
-    });
+    let bodyText = "";
+    let pageUrl = "";
+    let hasError = true;
+    let attempt = 0;
+    const MAX_RETRIES = 2;
 
-    await page.waitForTimeout(4000);
+    while (hasError && attempt <= MAX_RETRIES) {
+      if (attempt > 0) {
+        console.log(`RETRY ${attempt}/${MAX_RETRIES} for @${username}`);
+      }
+
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+
+      await page.waitForTimeout(6000);
+
+      bodyText = (await page.locator("body").innerText()).toLowerCase();
+      pageUrl = page.url().toLowerCase();
+
+      console.log(`DEBUG USER: ${username}`);
+      console.log(`DEBUG URL: ${page.url()}`);
+      console.log(`DEBUG TITLE: ${await page.title()}`);
+      console.log(`DEBUG TEXT: ${bodyText.slice(0, 1000)}`);
+
+      hasError = INSTA_ERROR_PHRASES.some((p) => bodyText.includes(p));
+
+      if (hasError) {
+        attempt++;
+      }
+    }
+
+    try {
+      await page.evaluate(() => {
+        window.scrollTo(0, 0);
+        document.body.style.background = "#000";
+        document.documentElement.style.background = "#000";
+      });
+    } catch {}
+
     await removePopups(page);
-    await page.waitForTimeout(1500);
-
-    await page.evaluate(() => {
-      window.scrollTo(0, 0);
-      document.body.style.zoom = "1.15";
-      document.body.style.background = "#000";
-      document.documentElement.style.background = "#000";
-    });
-
-    await page.waitForTimeout(1500);
-
-    const bodyText = (await page.locator("body").innerText()).toLowerCase();
-    const pageUrl = page.url().toLowerCase();
-
-    console.log("DEBUG USER:", username);
-    console.log("DEBUG URL:", page.url());
-    console.log("DEBUG TEXT:", bodyText.slice(0, 500));
+    await page.waitForTimeout(1000);
 
     const rawScreenshot = `screenshots/raw-${Date.now()}-${username}.png`;
     const finalScreenshot = `screenshots/${Date.now()}-${username}.png`;
@@ -291,9 +306,9 @@ async function checkInstagram(username) {
       path: rawScreenshot,
       clip: {
         x: 0,
-        y: 60,
-        width: 430,
-        height: 185,
+        y: 0,
+        width: 1280,
+        height: 400,
       },
     });
 
@@ -336,6 +351,7 @@ async function checkInstagram(username) {
       hasStats &&
       notBlackScreen;
 
+    if (hasError) return { status: "unknown", screenshot: finalScreenshot, stats };
     if (isBanned) return { status: "banned", screenshot: finalScreenshot, stats };
     if (isLoginOnly) return { status: "login", screenshot: finalScreenshot, stats };
     if (isActive) return { status: "active", screenshot: finalScreenshot, stats };
