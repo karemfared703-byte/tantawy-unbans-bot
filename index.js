@@ -38,6 +38,17 @@ const BROWSER_RESTART_MINUTES = Number(process.env.BROWSER_RESTART_MINUTES || 30
 const DASHBOARD_ENABLED = process.env.DASHBOARD_ENABLED !== "false";
 const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT || process.env.PORT || 3000);
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
+const TRIAL_DAYS = Math.max(1, Math.min(30, Number(process.env.TRIAL_DAYS || 7)));
+const BACKUP_EVERY_HOURS = Math.max(1, Math.min(168, Number(process.env.BACKUP_EVERY_HOURS || 6)));
+const OWNER_IDS = new Set(
+  String(process.env.OWNER_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
+const OWNER_LOG_CHANNEL_ID = String(process.env.OWNER_LOG_CHANNEL_ID || "").trim();
+const SUPPORT_CHANNEL_ID = String(process.env.SUPPORT_CHANNEL_ID || OWNER_LOG_CHANNEL_ID || "").trim();
+const COMMAND_DELETE_SECONDS = Math.max(0, Math.min(300, Number(process.env.COMMAND_DELETE_SECONDS || 10)));
 const STARTED_AT = Date.now();
 
 function resolveDataDir() {
@@ -50,6 +61,55 @@ const DATA_DIR = resolveDataDir();
 const MONITORS_FILE = process.env.MONITORS_FILE || path.join(DATA_DIR, "monitors.json");
 const GUILD_CONFIGS_FILE = process.env.GUILD_CONFIGS_FILE || path.join(DATA_DIR, "guild-configs.json");
 const RECENT_UNBANS_FILE = process.env.RECENT_UNBANS_FILE || path.join(DATA_DIR, "recent-unbans.json");
+const BACKUPS_DIR = process.env.BACKUPS_DIR || path.join(DATA_DIR, "backups");
+
+const PLAN_DEFINITIONS = {
+  trial: {
+    name: "Trial",
+    price: "Trial",
+    maxUsers: 2,
+    maxRooms: 3,
+    dailySessions: 10,
+    maxSessionHours: 6,
+    lockedFeatures: ["webhook"],
+  },
+  free: {
+    name: "Free",
+    price: "Free",
+    maxUsers: 1,
+    maxRooms: 2,
+    dailySessions: 5,
+    maxSessionHours: 2,
+    lockedFeatures: ["webhook", "daily_report", "white_label"],
+  },
+  basic: {
+    name: "Basic",
+    price: "300 EGP/month",
+    maxUsers: 5,
+    maxRooms: 8,
+    dailySessions: 50,
+    maxSessionHours: 24,
+    lockedFeatures: ["webhook"],
+  },
+  pro: {
+    name: "Pro",
+    price: "600 EGP/month",
+    maxUsers: 20,
+    maxRooms: 30,
+    dailySessions: 200,
+    maxSessionHours: 72,
+    lockedFeatures: [],
+  },
+  vip: {
+    name: "VIP",
+    price: "1000+ EGP/month",
+    maxUsers: 999,
+    maxRooms: 999,
+    dailySessions: 9999,
+    maxSessionHours: 720,
+    lockedFeatures: [],
+  },
+};
 
 const monitors = {};
 const guildConfigs = {};
@@ -117,6 +177,7 @@ function normalizeMonitorRecord(key, item) {
     channelId,
     lastStatus: item.lastStatus || "unknown",
     startedAt: Number(item.startedAt || Date.now()),
+    sessionExpiresAt: item.sessionExpiresAt ? Number(item.sessionExpiresAt) : null,
     bannedStartedAt: item.bannedStartedAt ? Number(item.bannedStartedAt) : null,
     activeHits: Number(item.activeHits || 0),
   };
@@ -168,34 +229,135 @@ function writeJsonAtomic(filePath, value) {
   fs.renameSync(tmpPath, filePath);
 }
 
+function todayKey(offsetMs = 0) {
+  return new Date(Date.now() + offsetMs).toISOString().slice(0, 10);
+}
+
+function addDays(timestamp, days) {
+  return timestamp + days * 24 * 60 * 60 * 1000;
+}
+
+function defaultGuildConfig(guildId, now = Date.now()) {
+  return {
+    guildId,
+    botName: "",
+    embedColor: "#5865F2",
+    logoUrl: "",
+    welcomeMessage: "",
+    guideMessage: "",
+    footerText: "",
+    errorMessage: "",
+    roomPrefix: "unban",
+    commandChannelId: null,
+    privateCategoryId: null,
+    logsChannelId: null,
+    guideChannelId: null,
+    supportChannelId: null,
+    allowedRoleId: null,
+    adminRoleId: null,
+    licenseExpiresAt: null,
+    plan: "trial",
+    planExpiresAt: addDays(now, TRIAL_DAYS),
+    trialStartedAt: now,
+    trialEndsAt: addDays(now, TRIAL_DAYS),
+    disabledByOwner: false,
+    cleanupHours: 24,
+    cooldownSeconds: 0,
+    commandDeleteSeconds: COMMAND_DELETE_SECONDS,
+    dailyReportEnabled: false,
+    lastDailyReportDate: "",
+    lang: "en",
+    webhookUrl: "",
+    paused: false,
+    rooms: {},
+    roomActivity: {},
+    roomCloseAt: {},
+    userCooldowns: {},
+    activity: {
+      date: todayKey(),
+      roomsOpened: 0,
+      sessionsStarted: 0,
+      stopped: 0,
+      cleared: 0,
+      errors: 0,
+      activeUsers: {},
+    },
+    feedback: {
+      count: 0,
+      total: 0,
+      last: [],
+    },
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function normalizeGuildConfig(guildId, config = {}, isLoaded = false) {
+  const now = Date.now();
+  const defaults = defaultGuildConfig(guildId, now);
+  const migratedPlan = config.plan || (isLoaded ? (config.licenseExpiresAt ? "basic" : "vip") : defaults.plan);
+  const plan = PLAN_DEFINITIONS[migratedPlan] ? migratedPlan : defaults.plan;
+  const trialStartedAt = Number(config.trialStartedAt || config.createdAt || now);
+  const trialEndsAt = Number(config.trialEndsAt || (plan === "trial" ? addDays(trialStartedAt, TRIAL_DAYS) : 0)) || null;
+
+  return {
+    ...defaults,
+    ...config,
+    guildId,
+    botName: String(config.botName || defaults.botName),
+    embedColor: String(config.embedColor || defaults.embedColor),
+    logoUrl: String(config.logoUrl || defaults.logoUrl),
+    welcomeMessage: String(config.welcomeMessage || defaults.welcomeMessage),
+    guideMessage: String(config.guideMessage || defaults.guideMessage),
+    footerText: String(config.footerText || defaults.footerText),
+    errorMessage: String(config.errorMessage || defaults.errorMessage),
+    roomPrefix: String(config.roomPrefix || defaults.roomPrefix),
+    commandChannelId: config.commandChannelId || null,
+    privateCategoryId: config.privateCategoryId || null,
+    logsChannelId: config.logsChannelId || null,
+    guideChannelId: config.guideChannelId || null,
+    supportChannelId: config.supportChannelId || null,
+    allowedRoleId: config.allowedRoleId || null,
+    adminRoleId: config.adminRoleId || null,
+    licenseExpiresAt: config.licenseExpiresAt ? Number(config.licenseExpiresAt) : null,
+    plan,
+    planExpiresAt: config.planExpiresAt ? Number(config.planExpiresAt) : (plan === "trial" ? trialEndsAt : (config.licenseExpiresAt ? Number(config.licenseExpiresAt) : null)),
+    trialStartedAt,
+    trialEndsAt,
+    disabledByOwner: Boolean(config.disabledByOwner),
+    cleanupHours: Number(config.cleanupHours ?? defaults.cleanupHours),
+    cooldownSeconds: Math.max(0, Math.min(3600, Number(config.cooldownSeconds || 0))),
+    commandDeleteSeconds: Math.max(0, Math.min(300, Number(config.commandDeleteSeconds ?? defaults.commandDeleteSeconds))),
+    dailyReportEnabled: Boolean(config.dailyReportEnabled),
+    lastDailyReportDate: String(config.lastDailyReportDate || ""),
+    lang: ["ar", "en"].includes(String(config.lang || "").toLowerCase()) ? String(config.lang).toLowerCase() : defaults.lang,
+    webhookUrl: String(config.webhookUrl || ""),
+    paused: Boolean(config.paused),
+    rooms: config.rooms && typeof config.rooms === "object" ? config.rooms : {},
+    roomActivity: config.roomActivity && typeof config.roomActivity === "object" ? config.roomActivity : {},
+    roomCloseAt: config.roomCloseAt && typeof config.roomCloseAt === "object" ? config.roomCloseAt : {},
+    userCooldowns: config.userCooldowns && typeof config.userCooldowns === "object" ? config.userCooldowns : {},
+    activity: config.activity && typeof config.activity === "object" ? { ...defaults.activity, ...config.activity } : defaults.activity,
+    feedback: config.feedback && typeof config.feedback === "object" ? {
+      count: Number(config.feedback.count || 0),
+      total: Number(config.feedback.total || 0),
+      last: Array.isArray(config.feedback.last) ? config.feedback.last.slice(-10) : [],
+    } : defaults.feedback,
+    createdAt: Number(config.createdAt || now),
+    updatedAt: Number(config.updatedAt || now),
+  };
+}
+
 function getGuildConfig(guildId) {
   if (!guildConfigs[guildId]) {
-    guildConfigs[guildId] = {
-      guildId,
-      botName: "",
-      embedColor: "#5865F2",
-      logoUrl: "",
-      welcomeMessage: "",
-      roomPrefix: "unban",
-      commandChannelId: null,
-      privateCategoryId: null,
-      logsChannelId: null,
-      allowedRoleId: null,
-      adminRoleId: null,
-      licenseExpiresAt: null,
-      cleanupHours: 24,
-      paused: false,
-      rooms: {},
-      roomActivity: {},
-      roomCloseAt: {},
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
+    guildConfigs[guildId] = defaultGuildConfig(guildId);
   }
 
+  guildConfigs[guildId] = normalizeGuildConfig(guildId, guildConfigs[guildId]);
   if (!guildConfigs[guildId].rooms) guildConfigs[guildId].rooms = {};
   if (!guildConfigs[guildId].roomActivity) guildConfigs[guildId].roomActivity = {};
   if (!guildConfigs[guildId].roomCloseAt) guildConfigs[guildId].roomCloseAt = {};
+  if (!guildConfigs[guildId].userCooldowns) guildConfigs[guildId].userCooldowns = {};
   return guildConfigs[guildId];
 }
 
@@ -211,27 +373,7 @@ function loadGuildConfigs() {
 
     for (const [guildId, config] of Object.entries(saved)) {
       if (!config || typeof config !== "object") continue;
-      guildConfigs[guildId] = {
-        guildId,
-        botName: String(config.botName || ""),
-        embedColor: String(config.embedColor || "#5865F2"),
-        logoUrl: String(config.logoUrl || ""),
-        welcomeMessage: String(config.welcomeMessage || ""),
-        roomPrefix: String(config.roomPrefix || "unban"),
-        commandChannelId: config.commandChannelId || null,
-        privateCategoryId: config.privateCategoryId || null,
-        logsChannelId: config.logsChannelId || null,
-        allowedRoleId: config.allowedRoleId || null,
-        adminRoleId: config.adminRoleId || null,
-        licenseExpiresAt: config.licenseExpiresAt ? Number(config.licenseExpiresAt) : null,
-        cleanupHours: Number(config.cleanupHours || 24),
-        paused: Boolean(config.paused),
-        rooms: config.rooms && typeof config.rooms === "object" ? config.rooms : {},
-        roomActivity: config.roomActivity && typeof config.roomActivity === "object" ? config.roomActivity : {},
-        roomCloseAt: config.roomCloseAt && typeof config.roomCloseAt === "object" ? config.roomCloseAt : {},
-        createdAt: Number(config.createdAt || Date.now()),
-        updatedAt: Number(config.updatedAt || Date.now()),
-      };
+      guildConfigs[guildId] = normalizeGuildConfig(guildId, config, true);
       count++;
     }
 
@@ -294,17 +436,445 @@ function getEmbedColor(guildOrId) {
   return parseColor(config.embedColor);
 }
 
-function getLicenseStatus(guildId) {
-  const config = getGuildConfig(guildId);
-  if (!config.licenseExpiresAt) return { active: true, label: "Lifetime", daysLeft: null };
+function getPlanDefinition(plan) {
+  return PLAN_DEFINITIONS[String(plan || "").toLowerCase()] || PLAN_DEFINITIONS.trial;
+}
 
-  const msLeft = config.licenseExpiresAt - Date.now();
+function formatLimit(value) {
+  return value >= 999 ? "Unlimited" : String(value);
+}
+
+function getPlanStatus(guildId) {
+  const config = getGuildConfig(guildId);
+  const plan = getPlanDefinition(config.plan);
+  const expiresAt = config.planExpiresAt || config.licenseExpiresAt || null;
+
+  if (config.disabledByOwner) {
+    return {
+      active: false,
+      plan,
+      planKey: config.plan,
+      label: `${plan.name} - disabled by owner`,
+      reason: "This server has been disabled. Contact support.",
+      daysLeft: null,
+      expiresAt,
+    };
+  }
+
+  if (!expiresAt) {
+    return {
+      active: true,
+      plan,
+      planKey: config.plan,
+      label: `${plan.name} - Lifetime`,
+      reason: "",
+      daysLeft: null,
+      expiresAt: null,
+    };
+  }
+
+  const msLeft = expiresAt - Date.now();
   const daysLeft = Math.ceil(msLeft / (1000 * 60 * 60 * 24));
   return {
     active: msLeft > 0,
-    label: msLeft > 0 ? `${daysLeft} day(s) left` : `Expired ${Math.abs(daysLeft)} day(s) ago`,
+    plan,
+    planKey: config.plan,
+    label: msLeft > 0
+      ? `${plan.name} - ${daysLeft} day(s) left`
+      : `${plan.name} - expired ${Math.abs(daysLeft)} day(s) ago`,
+    reason: msLeft > 0
+      ? ""
+      : (config.plan === "trial"
+        ? "Your trial has expired. Contact support to renew."
+        : "This server license has expired. Contact support."),
     daysLeft,
+    expiresAt,
   };
+}
+
+function getLicenseStatus(guildId) {
+  const status = getPlanStatus(guildId);
+  return {
+    active: status.active,
+    label: status.label,
+    daysLeft: status.daysLeft,
+  };
+}
+
+function getPlanLimitsText(guildId) {
+  const status = getPlanStatus(guildId);
+  const plan = status.plan;
+  const locked = plan.lockedFeatures.length ? plan.lockedFeatures.join(", ") : "None";
+  return [
+    `Plan: ${plan.name}`,
+    `Price: ${plan.price}`,
+    `Users: ${formatLimit(plan.maxUsers)}`,
+    `Private rooms: ${formatLimit(plan.maxRooms)}`,
+    `Daily sessions: ${formatLimit(plan.dailySessions)}`,
+    `Session duration: ${formatLimit(plan.maxSessionHours)} hour(s)`,
+    `Locked features: ${locked}`,
+  ].join("\n");
+}
+
+function getGuildActiveUserIds(guildId) {
+  const config = getGuildConfig(guildId);
+  const ids = new Set(Object.keys(config.rooms || {}));
+  for (const item of Object.values(monitors)) {
+    if (item.guildId === guildId && item.userId) ids.add(item.userId);
+  }
+  return ids;
+}
+
+function getDailyActivity(guildId) {
+  const config = getGuildConfig(guildId);
+  const key = todayKey();
+  if (!config.activity || config.activity.date !== key) {
+    config.activity = {
+      date: key,
+      roomsOpened: 0,
+      sessionsStarted: 0,
+      stopped: 0,
+      cleared: 0,
+      errors: 0,
+      activeUsers: {},
+    };
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+  }
+  if (!config.activity.activeUsers || typeof config.activity.activeUsers !== "object") {
+    config.activity.activeUsers = {};
+  }
+  return config.activity;
+}
+
+function incrementActivity(guildId, field, userId = null, amount = 1) {
+  const activity = getDailyActivity(guildId);
+  activity[field] = Number(activity[field] || 0) + amount;
+  if (userId) {
+    activity.activeUsers[userId] = Number(activity.activeUsers[userId] || 0) + amount;
+  }
+  const config = getGuildConfig(guildId);
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+}
+
+function getTopActivityUser(guildId) {
+  const activity = getDailyActivity(guildId);
+  const entries = Object.entries(activity.activeUsers || {}).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) return "None";
+  return `<@${entries[0][0]}> (${entries[0][1]})`;
+}
+
+function getFeatureBlockReason(guildId, feature) {
+  const status = getPlanStatus(guildId);
+  if (!status.active) return status.reason;
+  if (feature && status.plan.lockedFeatures.includes(feature)) {
+    return `${feature.replace(/_/g, " ")} is locked on the ${status.plan.name} plan. Upgrade this server plan to use it.`;
+  }
+  return "";
+}
+
+function getRoomCreationBlockReason(guildId, userId) {
+  const status = getPlanStatus(guildId);
+  if (!status.active) return status.reason;
+
+  const config = getGuildConfig(guildId);
+  const plan = status.plan;
+  const existingRoom = Boolean(config.rooms?.[userId]);
+  const roomCount = Object.keys(config.rooms || {}).length;
+  const activeUsers = getGuildActiveUserIds(guildId);
+
+  if (!existingRoom && roomCount >= plan.maxRooms) {
+    return `This plan allows ${formatLimit(plan.maxRooms)} private room(s). Upgrade the server plan or close old rooms.`;
+  }
+
+  if (!activeUsers.has(userId) && activeUsers.size >= plan.maxUsers) {
+    return `This plan allows ${formatLimit(plan.maxUsers)} user(s). Upgrade the server plan.`;
+  }
+
+  return "";
+}
+
+function checkCooldown(guildId, userId, action) {
+  const config = getGuildConfig(guildId);
+  const seconds = Number(config.cooldownSeconds || 0);
+  if (!seconds) return { allowed: true, remaining: 0 };
+
+  const key = `${userId}:${action}`;
+  const last = Number(config.userCooldowns?.[key] || 0);
+  const remaining = seconds * 1000 - (Date.now() - last);
+  return {
+    allowed: remaining <= 0,
+    remaining: Math.ceil(Math.max(0, remaining) / 1000),
+  };
+}
+
+function markCooldown(guildId, userId, action) {
+  const config = getGuildConfig(guildId);
+  if (!config.cooldownSeconds) return;
+  config.userCooldowns[`${userId}:${action}`] = Date.now();
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+}
+
+function consumeDailySession(guildId, userId) {
+  const status = getPlanStatus(guildId);
+  if (!status.active) return status.reason;
+
+  const activity = getDailyActivity(guildId);
+  if (Number(activity.sessionsStarted || 0) >= status.plan.dailySessions) {
+    return `This plan allows ${formatLimit(status.plan.dailySessions)} session(s) per day. Upgrade this server plan.`;
+  }
+
+  incrementActivity(guildId, "sessionsStarted", userId);
+  return "";
+}
+
+function getSessionExpiresAt(guildId) {
+  const status = getPlanStatus(guildId);
+  const hours = Number(status.plan.maxSessionHours || 0);
+  if (!hours || hours >= 999) return null;
+  return Date.now() + hours * 60 * 60 * 1000;
+}
+
+function getFeedbackSummary(guildId) {
+  const feedback = getGuildConfig(guildId).feedback || { count: 0, total: 0 };
+  const count = Number(feedback.count || 0);
+  const total = Number(feedback.total || 0);
+  return {
+    count,
+    average: count ? (total / count).toFixed(1) : "N/A",
+  };
+}
+
+function recordRating(guildId, userId, score) {
+  const config = getGuildConfig(guildId);
+  const value = Math.max(1, Math.min(5, Number(score || 0)));
+  if (!config.feedback) config.feedback = { count: 0, total: 0, last: [] };
+  config.feedback.count = Number(config.feedback.count || 0) + 1;
+  config.feedback.total = Number(config.feedback.total || 0) + value;
+  config.feedback.last = Array.isArray(config.feedback.last) ? config.feedback.last : [];
+  config.feedback.last.push({ userId, score: value, at: Date.now() });
+  config.feedback.last = config.feedback.last.slice(-10);
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+}
+
+function isOwner(userId) {
+  return OWNER_IDS.has(String(userId || ""));
+}
+
+function shortValue(value, max = 900) {
+  const text = String(value ?? "");
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+async function sendOwnerReport(title, fields = {}, files = []) {
+  const description = Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `**${key}:** ${shortValue(value, 900)}`)
+    .join("\n") || "No details.";
+
+  const embed = new EmbedBuilder()
+    .setColor(0xff3366)
+    .setTitle(shortValue(title, 250))
+    .setDescription(description)
+    .setTimestamp(new Date());
+
+  const payload = { embeds: [embed] };
+  if (files.length) payload.files = files;
+
+  try {
+    const channelId = SUPPORT_CHANNEL_ID || OWNER_LOG_CHANNEL_ID;
+    if (channelId) {
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (channel?.isTextBased?.()) {
+        await channel.send(payload);
+        return true;
+      }
+    }
+
+    for (const ownerId of OWNER_IDS) {
+      const user = await client.users.fetch(ownerId).catch(() => null);
+      if (!user) continue;
+      await user.send(payload).catch(() => {});
+    }
+    return OWNER_IDS.size > 0;
+  } catch (error) {
+    console.log("Owner report error:", error.message);
+    return false;
+  }
+}
+
+async function sendBroadcastToGuild(guildId, text) {
+  const config = getGuildConfig(guildId);
+  const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) return false;
+
+  const channelId = config.logsChannelId || config.commandChannelId || guild.systemChannelId;
+  const channel = channelId ? await client.channels.fetch(channelId).catch(() => null) : null;
+  if (!channel?.isTextBased?.()) return false;
+
+  const embed = new EmbedBuilder()
+    .setColor(getEmbedColor(guildId))
+    .setTitle("Bot Announcement")
+    .setDescription(shortValue(text, 3500))
+    .setFooter({ text: getConfiguredBotName(guild) })
+    .setTimestamp(new Date());
+
+  await channel.send({ embeds: [embed] });
+  return true;
+}
+
+async function broadcastToGuilds(text) {
+  let sent = 0;
+  let failed = 0;
+
+  for (const guild of client.guilds.cache.values()) {
+    const ok = await sendBroadcastToGuild(guild.id, text).catch(() => false);
+    if (ok) sent++;
+    else failed++;
+  }
+
+  return { sent, failed };
+}
+
+async function emitWebhookEvent(guildId, type, payload = {}) {
+  const config = getGuildConfig(guildId);
+  const url = String(config.webhookUrl || "").trim();
+  if (!url) return;
+
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type,
+        guildId,
+        at: new Date().toISOString(),
+        payload,
+      }),
+    });
+  } catch (error) {
+    console.log("Webhook event error:", error.message);
+  }
+}
+
+async function reportError(error, context = {}) {
+  const message = error?.message || String(error || "Unknown error");
+  const guildId = context.guildId || context.guild?.id || context.message?.guild?.id || null;
+
+  if (guildId) {
+    incrementActivity(guildId, "errors", context.userId || context.message?.author?.id || null);
+    addOperationLog(guildId, "Error reported", {
+      command: context.command || "",
+      error: message,
+    });
+    await emitWebhookEvent(guildId, "error", {
+      command: context.command || "",
+      userId: context.userId || context.message?.author?.id || "",
+      error: message,
+    });
+  }
+
+  await sendOwnerReport("Bot error", {
+    server: context.guild?.name || context.message?.guild?.name || guildId || "unknown",
+    command: context.command || "unknown",
+    user: context.userTag || context.message?.author?.tag || context.userId || "unknown",
+    error: message,
+  });
+}
+
+function createBackup() {
+  fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filePath = path.join(BACKUPS_DIR, `backup-${timestamp}.json`);
+  writeJsonAtomic(filePath, {
+    createdAt: new Date().toISOString(),
+    dataDir: DATA_DIR,
+    monitors,
+    guildConfigs,
+    recentUnbans,
+  });
+
+  try {
+    const files = fs.readdirSync(BACKUPS_DIR)
+      .filter((file) => file.startsWith("backup-") && file.endsWith(".json"))
+      .sort();
+    for (const old of files.slice(0, Math.max(0, files.length - 30))) {
+      fs.unlinkSync(path.join(BACKUPS_DIR, old));
+    }
+  } catch (error) {
+    console.log("Backup prune error:", error.message);
+  }
+
+  return filePath;
+}
+
+function startBackupLoop() {
+  try {
+    const filePath = createBackup();
+    console.log(`Backup created: ${filePath}`);
+  } catch (error) {
+    console.log("Backup error:", error.message);
+  }
+
+  setInterval(() => {
+    try {
+      const filePath = createBackup();
+      console.log(`Backup created: ${filePath}`);
+    } catch (error) {
+      console.log("Backup error:", error.message);
+      reportError(error, { command: "auto-backup" }).catch(() => {});
+    }
+  }, BACKUP_EVERY_HOURS * 60 * 60 * 1000);
+}
+
+async function sendDailyActivityReport(guildId, force = false) {
+  const config = getGuildConfig(guildId);
+  if (!force && !config.dailyReportEnabled) return false;
+  if (!config.logsChannelId) return false;
+
+  const key = todayKey();
+  if (!force && config.lastDailyReportDate === key) return false;
+  if (!force && new Date().getUTCHours() < 20) return false;
+
+  const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+  const channel = await client.channels.fetch(config.logsChannelId).catch(() => null);
+  if (!guild || !channel?.isTextBased?.()) return false;
+
+  const activity = getDailyActivity(guildId);
+  const feedback = getFeedbackSummary(guildId);
+  const embed = new EmbedBuilder()
+    .setColor(getEmbedColor(guildId))
+    .setTitle("Daily Activity Report")
+    .setDescription(
+      `**Server:** ${guild.name}\n` +
+      `**Private rooms opened:** ${activity.roomsOpened || 0}\n` +
+      `**Sessions started:** ${activity.sessionsStarted || 0}\n` +
+      `**Stopped:** ${activity.stopped || 0}\n` +
+      `**Cleared:** ${activity.cleared || 0}\n` +
+      `**Errors:** ${activity.errors || 0}\n` +
+      `**Most active user:** ${getTopActivityUser(guildId)}\n` +
+      `**Average rating:** ${feedback.average} (${feedback.count})`
+    )
+    .setTimestamp(new Date());
+
+  await channel.send({ embeds: [embed] });
+  config.lastDailyReportDate = key;
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+  return true;
+}
+
+function startDailyReportLoop() {
+  setInterval(() => {
+    for (const guildId of Object.keys(guildConfigs)) {
+      sendDailyActivityReport(guildId).catch((error) => {
+        console.log("Daily report error:", error.message);
+      });
+    }
+  }, 60 * 60 * 1000);
 }
 
 function hasRole(member, roleId) {
@@ -314,6 +884,7 @@ function hasRole(member, roleId) {
 function canUseBot(member) {
   if (!member?.guild) return false;
   const config = getGuildConfig(member.guild.id);
+  if (isOwner(member.user?.id)) return true;
   if (isAdmin(member)) return true;
   if (!config.allowedRoleId) return true;
   return hasRole(member, config.allowedRoleId);
@@ -1113,6 +1684,12 @@ function parseDurationMs(value) {
   return amount * multipliers[unit];
 }
 
+function deleteMessageLater(message, seconds = COMMAND_DELETE_SECONDS) {
+  const wait = Math.max(0, Number(seconds || 0));
+  if (!message?.delete || !wait) return;
+  setTimeout(() => message.delete().catch(() => {}), wait * 1000);
+}
+
 function getCommandButtons() {
   return [
     new ActionRowBuilder().addComponents(
@@ -1128,26 +1705,50 @@ function getCommandButtons() {
   ];
 }
 
+function getRatingButtons() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("bot:rate:1").setLabel("1").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("bot:rate:2").setLabel("2").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("bot:rate:3").setLabel("3").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("bot:rate:4").setLabel("4").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("bot:rate:5").setLabel("5").setStyle(ButtonStyle.Success)
+    ),
+  ];
+}
+
 function buildWelcomeEmbed(member) {
   const config = getGuildConfig(member.guild.id);
   const name = config.botName || getConfiguredBotName(member.guild);
-  const description = config.welcomeMessage ||
-    "Your private room is ready. Use the buttons below or type a command.";
-
-  const embed = new EmbedBuilder()
-    .setColor(getEmbedColor(member.guild.id))
-    .setTitle(`Welcome ${member.displayName || member.user.username}`)
-    .setDescription(
-      `${description}\n\n` +
-      "**Available Commands:**\n" +
+  const isArabic = config.lang === "ar";
+  const description = config.welcomeMessage || (
+    isArabic
+      ? "الروم الخاص جاهز. استخدم الازرار تحت او اكتب الامر اللي محتاجه."
+      : "Your private room is ready. Use the buttons below or type a command."
+  );
+  const commandsText = isArabic
+    ? "**Available Commands:**\n" +
       "`!t username` - Start monitoring\n" +
       "`!stop username` - Stop monitoring\n" +
       "`!list` - Show your list\n" +
       "`!stats` - Show stats\n" +
       "`!sesun 24` - Recent unbans\n" +
+      "`!support` - Contact support\n" +
       "`!close` - Close this room"
-    )
-    .setFooter({ text: name });
+    : "**Available Commands:**\n" +
+      "`!t username` - Start monitoring\n" +
+      "`!stop username` - Stop monitoring\n" +
+      "`!list` - Show your list\n" +
+      "`!stats` - Show stats\n" +
+      "`!sesun 24` - Recent unbans\n" +
+      "`!support` - Contact support\n" +
+      "`!close` - Close this room";
+
+  const embed = new EmbedBuilder()
+    .setColor(getEmbedColor(member.guild.id))
+    .setTitle(`Welcome ${member.displayName || member.user.username}`)
+    .setDescription(`${description}\n\n${commandsText}`)
+    .setFooter({ text: config.footerText || name });
 
   if (config.logoUrl) embed.setThumbnail(config.logoUrl);
   return embed;
@@ -1162,6 +1763,21 @@ async function sendWelcomeMessage(channel, member) {
   } catch (error) {
     console.log("Welcome message error:", error.message);
   }
+}
+
+async function requestRoomRatingAndClose(guild, userId, channel, reason = "User requested close") {
+  const config = getGuildConfig(guild.id);
+  config.roomCloseAt[userId] = Date.now() + 60 * 1000;
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+
+  await channel.send({
+    content: "Rate your experience from 1 to 5. This room will close in 60 seconds.",
+    components: getRatingButtons(),
+  }).catch(() => {});
+
+  await sendGuildLog(guild.id, "Private room close scheduled", { userId, reason });
+  setTimeout(() => closeUserRoom(guild, userId, reason).catch(() => {}), 60 * 1000);
 }
 
 async function applyServerBotName(message, name) {
@@ -1225,6 +1841,13 @@ function resolveCategory(message, args) {
 async function ensureUserRoom(message) {
   const guild = message.guild;
   const config = getGuildConfig(guild.id);
+  const planBlock = getRoomCreationBlockReason(guild.id, message.author.id);
+  if (planBlock) {
+    const error = new Error(planBlock);
+    error.code = "PLAN_LIMIT";
+    throw error;
+  }
+
   const existingId = config.rooms?.[message.author.id];
 
   if (existingId) {
@@ -1277,9 +1900,16 @@ async function ensureUserRoom(message) {
   config.updatedAt = Date.now();
   saveGuildConfigs();
   await sendWelcomeMessage(channel, message.member);
+  incrementActivity(guild.id, "roomsOpened", message.author.id);
   await sendGuildLog(guild.id, "Private room opened", {
     user: message.author.tag,
     channel: `#${channel.name}`,
+  });
+  await emitWebhookEvent(guild.id, "room_created", {
+    userId: message.author.id,
+    userTag: message.author.tag,
+    channelId: channel.id,
+    channelName: channel.name,
   });
 
   return channel;
@@ -1303,6 +1933,7 @@ async function closeUserRoom(guild, userId, reason = "Closed") {
   }
 
   await sendGuildLog(guild.id, "Private room closed", { userId, reason });
+  await emitWebhookEvent(guild.id, "room_closed", { userId, reason });
   return true;
 }
 
@@ -1359,7 +1990,7 @@ async function getUserCommandChannel(message) {
 
   if (room.id !== message.channel.id) {
     await message.channel.send(`${message.author}, your private bot room is <#${room.id}>.`)
-      .then((msg) => setTimeout(() => msg.delete().catch(() => {}), 15000))
+      .then((msg) => deleteMessageLater(msg, config.commandDeleteSeconds || COMMAND_DELETE_SECONDS))
       .catch(() => {});
   }
 
@@ -1382,8 +2013,10 @@ function buildHelpEmbed(guild) {
       { name: "!stats", value: "Show monitoring statistics. (`!stats`)" },
       { name: "!sesun", value: "Show recently unbanned accounts. (`!sesun <hours>`)" },
       { name: "!close", value: "Close your private room now or later. (`!close [10m]`)" },
+      { name: "!support", value: "Send a support request to the bot owner. (`!support`)" },
+      { name: "!plan", value: "Show plan info and limits. (`!plan info`, `!plan limits`)" },
       { name: "!health", value: "Show bot health and storage status. (`!health`)" },
-      { name: "Admin setup", value: "`!setupname <name>`\n`!setupchannel [#channel]`\n`!setupcategory <category>`\n`!setuplogs #bot-logs`\n`!setuprole @Role`\n`!setupadminrole @Role`\n`!setupcleanup 24`\n`!setupbrand color #ff0055`\n`!license info`" }
+      { name: "Admin setup", value: "`!quicksetup <name>`\n`!setup`\n`!setupname <name>`\n`!setupchannel [#channel]`\n`!setupcategory <category>`\n`!setuplogs #bot-logs`\n`!setuprole @Role`\n`!setupadminrole @Role`\n`!setupcleanup 24`\n`!setupcooldown 60`\n`!setupbrand color #ff0055`\n`!setwebhook https://...`\n`!setupdailyreport on`\n`!exportconfig`" }
     )
     .setFooter({ text: botName });
 }
@@ -1394,11 +2027,13 @@ function buildStatsEmbed(message) {
   const userEntries = getUserMonitorEntries(guildId, userId).map(([, item]) => item);
   const guildEntries = Object.values(monitors).filter((item) => item.guildId === guildId);
   const counts = {};
+  const activity = getDailyActivity(guildId);
+  const feedback = getFeedbackSummary(guildId);
 
   for (const item of guildEntries) {
     counts[item.lastStatus || "unknown"] = (counts[item.lastStatus || "unknown"] || 0) + 1;
   }
-  const license = getLicenseStatus(guildId);
+  const plan = getPlanStatus(guildId);
 
   return new EmbedBuilder()
     .setColor(getEmbedColor(guildId))
@@ -1408,7 +2043,10 @@ function buildStatsEmbed(message) {
       `**Server monitored accounts:** ${guildEntries.length}\n` +
       `**Active:** ${counts.active || 0}\n` +
       `**Banned/Login/Unknown:** ${(counts.banned || 0) + (counts.login || 0) + (counts.unknown || 0)}\n` +
-      `**License:** ${license.label}`
+      `**Plan:** ${plan.label}\n` +
+      `**Today sessions:** ${activity.sessionsStarted || 0}/${formatLimit(plan.plan.dailySessions)}\n` +
+      `**Today rooms opened:** ${activity.roomsOpened || 0}\n` +
+      `**Average rating:** ${feedback.average} (${feedback.count})`
     );
 }
 
@@ -1447,16 +2085,285 @@ function buildHealthEmbed(guild = null) {
     .setDescription(
       `**Bot status:** Online\n` +
       `**Data directory:** ${DATA_DIR}\n` +
+      `**Backups directory:** ${BACKUPS_DIR}\n` +
       `**Storage:** ${storageOk ? "OK" : "ERROR"}\n` +
       `**Uptime:** ${uptime}\n` +
       `**Servers:** ${client.guilds.cache.size}\n` +
       `**Private rooms:** ${privateRooms}\n` +
+      `**Owner IDs configured:** ${OWNER_IDS.size}\n` +
       `**Queue:** ${queue.length}\n` +
       `**Active jobs:** ${activeJobs}`
     );
 
   if (guild) embed.setFooter({ text: getConfiguredBotName(guild) });
   return embed;
+}
+
+function buildGuideEmbed(guild) {
+  const config = getGuildConfig(guild.id);
+  const botName = getConfiguredBotName(guild);
+  const description = config.guideMessage || [
+    `Welcome to ${botName}.`,
+    "",
+    "Start by typing `!chat` in the command channel. The bot will create a private room that only you and the bot can see.",
+    "",
+    "Inside your private room you can use buttons or commands.",
+  ].join("\n");
+
+  const embed = new EmbedBuilder()
+    .setColor(getEmbedColor(guild.id))
+    .setTitle(`${botName} Guide`)
+    .setDescription(description)
+    .addFields(
+      { name: "User commands", value: "`!chat`\n`!t username`\n`!stop username`\n`!list`\n`!stats`\n`!sesun 24`\n`!support`\n`!close`" },
+      { name: "Admin commands", value: "`!quicksetup <name>`\n`!setupinfo`\n`!setupbrand ...`\n`!setupcooldown 60`\n`!setupdailyreport on`\n`!setwebhook https://...`" }
+    )
+    .setFooter({ text: config.footerText || botName });
+
+  if (config.logoUrl) embed.setThumbnail(config.logoUrl);
+  return embed;
+}
+
+async function publishGuide(guild, channel = null) {
+  const config = getGuildConfig(guild.id);
+  const target = channel ||
+    (config.guideChannelId ? await client.channels.fetch(config.guideChannelId).catch(() => null) : null) ||
+    (config.commandChannelId ? await client.channels.fetch(config.commandChannelId).catch(() => null) : null);
+
+  if (!target?.isTextBased?.()) return null;
+  return target.send({ embeds: [buildGuideEmbed(guild)] });
+}
+
+function resolveTextChannelByInput(guild, input, fallback = null) {
+  const raw = String(input || "").trim().replace(/[<#>]/g, "");
+  if (!raw || raw.toLowerCase() === "skip") return fallback;
+  const byId = guild.channels.cache.get(raw);
+  if (byId?.type === ChannelType.GuildText) return byId;
+  return guild.channels.cache.find(
+    (channel) => channel.type === ChannelType.GuildText && channel.name.toLowerCase() === raw.toLowerCase()
+  ) || fallback;
+}
+
+function resolveCategoryByInput(guild, input, fallback = null) {
+  const raw = String(input || "").trim().replace(/[<#>]/g, "");
+  if (!raw || raw.toLowerCase() === "skip") return fallback;
+  const byId = guild.channels.cache.get(raw);
+  if (byId?.type === ChannelType.GuildCategory) return byId;
+  return guild.channels.cache.find(
+    (channel) => channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === raw.toLowerCase()
+  ) || fallback;
+}
+
+async function findOrCreateCategory(guild, name, permissionOverwrites = []) {
+  const channelName = String(name || "Unban Rooms").trim().slice(0, 90) || "Unban Rooms";
+  const existing = guild.channels.cache.find(
+    (channel) => channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === channelName.toLowerCase()
+  );
+  if (existing) return existing;
+  return guild.channels.create({
+    name: channelName,
+    type: ChannelType.GuildCategory,
+    permissionOverwrites,
+  });
+}
+
+async function findOrCreateTextChannel(guild, name, options = {}) {
+  const channelName = sanitizeChannelName(name);
+  const existing = guild.channels.cache.find(
+    (channel) => channel.type === ChannelType.GuildText && channel.name.toLowerCase() === channelName
+  );
+  if (existing) return existing;
+  return guild.channels.create({
+    name: channelName,
+    type: ChannelType.GuildText,
+    parent: options.parent || undefined,
+    topic: options.topic || undefined,
+    permissionOverwrites: options.permissionOverwrites || undefined,
+  });
+}
+
+async function runSetupWizard(message) {
+  const config = getGuildConfig(message.guild.id);
+  const filter = (reply) => reply.author.id === message.author.id && reply.channel.id === message.channel.id;
+  const ask = async (prompt) => {
+    await message.channel.send(prompt);
+    const collected = await message.channel.awaitMessages({ filter, max: 1, time: 120000, errors: ["time"] });
+    return collected.first().content.trim();
+  };
+
+  try {
+    const botName = await ask("Setup 1/4: send the bot nickname, or `skip`.");
+    if (botName.toLowerCase() !== "skip") {
+      if (botName.length < 2 || botName.length > 32) return message.reply("Nickname must be 2-32 characters.");
+      await applyServerBotName(message, botName);
+    }
+
+    const commandAnswer = await ask("Setup 2/4: mention the command channel, send its ID/name, or `skip`.");
+    const commandChannel = resolveTextChannelByInput(message.guild, commandAnswer, null);
+    if (commandChannel) config.commandChannelId = commandChannel.id;
+
+    const categoryAnswer = await ask("Setup 3/4: send the private category name/ID, or `skip`.");
+    const category = resolveCategoryByInput(message.guild, categoryAnswer, null);
+    if (category) config.privateCategoryId = category.id;
+
+    const logsAnswer = await ask("Setup 4/4: mention the logs channel, send its ID/name, or `skip`.");
+    const logsChannel = resolveTextChannelByInput(message.guild, logsAnswer, null);
+    if (logsChannel) config.logsChannelId = logsChannel.id;
+
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    await sendGuildLog(message.guild.id, "Setup wizard completed", { by: message.author.tag });
+    return message.reply("Setup wizard completed. Run `!setupinfo` to review settings.");
+  } catch {
+    return message.reply("Setup wizard timed out. Run `!setup` again when you are ready.");
+  }
+}
+
+async function runQuickSetup(message, rawName) {
+  const guild = message.guild;
+  const config = getGuildConfig(guild.id);
+  const botName = rawName.trim().slice(0, 32) || config.botName || "Unbans Bot";
+
+  const privateCategory = await findOrCreateCategory(guild, "Unban Rooms", [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+  ]);
+  const commandChannel = await findOrCreateTextChannel(guild, "unban-bot", {
+    topic: "Use !chat to open your private bot room.",
+  });
+  const guideChannel = await findOrCreateTextChannel(guild, "how-to-use", {
+    topic: "How to use the unbans bot.",
+    permissionOverwrites: [
+      {
+        id: guild.roles.everyone.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+        deny: [PermissionFlagsBits.SendMessages],
+      },
+      {
+        id: client.user.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks],
+      },
+    ],
+  });
+  const logsChannel = await findOrCreateTextChannel(guild, "bot-logs", {
+    topic: "Private bot logs.",
+    permissionOverwrites: [
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      {
+        id: client.user.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks],
+      },
+    ],
+  });
+
+  config.botName = botName;
+  config.commandChannelId = commandChannel.id;
+  config.privateCategoryId = privateCategory.id;
+  config.logsChannelId = logsChannel.id;
+  config.guideChannelId = guideChannel.id;
+  config.roomPrefix = sanitizeChannelName(botName).slice(0, 24) || "unban";
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+
+  await applyServerBotName(message, botName);
+  await publishGuide(guild, guideChannel);
+  await sendGuildLog(guild.id, "Quick setup completed", { by: message.author.tag });
+
+  return message.reply(
+    `Quick setup completed.\n` +
+    `Command channel: ${commandChannel}\n` +
+    `Guide channel: ${guideChannel}\n` +
+    `Logs channel: ${logsChannel}\n` +
+    `Private category: **${privateCategory.name}**`
+  );
+}
+
+function parseDaysInput(value, fallback = 30) {
+  const text = String(value || "").trim().toLowerCase();
+  const match = text.match(/^(\d+)(d|day|days)?$/);
+  if (!match) return fallback;
+  return Math.max(1, Math.min(3650, Number(match[1])));
+}
+
+function sanitizeWebhookUrl(value) {
+  const text = String(value || "").trim();
+  if (!text || text.toLowerCase() === "clear" || text.toLowerCase() === "none") return "";
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "https:") return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function exportableGuildConfig(config) {
+  return {
+    botName: config.botName || "",
+    embedColor: config.embedColor || "#5865F2",
+    logoUrl: config.logoUrl || "",
+    welcomeMessage: config.welcomeMessage || "",
+    guideMessage: config.guideMessage || "",
+    footerText: config.footerText || "",
+    errorMessage: config.errorMessage || "",
+    roomPrefix: config.roomPrefix || "unban",
+    commandChannelId: config.commandChannelId || null,
+    privateCategoryId: config.privateCategoryId || null,
+    logsChannelId: config.logsChannelId || null,
+    guideChannelId: config.guideChannelId || null,
+    allowedRoleId: config.allowedRoleId || null,
+    adminRoleId: config.adminRoleId || null,
+    cleanupHours: Number(config.cleanupHours || 24),
+    cooldownSeconds: Number(config.cooldownSeconds || 0),
+    commandDeleteSeconds: Number(config.commandDeleteSeconds || COMMAND_DELETE_SECONDS),
+    dailyReportEnabled: Boolean(config.dailyReportEnabled),
+    lang: config.lang || "en",
+    webhookUrl: config.webhookUrl || "",
+  };
+}
+
+function applyImportedGuildConfig(guildId, imported) {
+  const config = getGuildConfig(guildId);
+  const source = imported.config && typeof imported.config === "object" ? imported.config : imported;
+  const allowed = exportableGuildConfig(source);
+
+  config.botName = String(allowed.botName || "").slice(0, 32);
+  config.logoUrl = String(allowed.logoUrl || "");
+  config.welcomeMessage = String(allowed.welcomeMessage || "").slice(0, 500);
+  config.guideMessage = String(allowed.guideMessage || "").slice(0, 1500);
+  config.footerText = String(allowed.footerText || "").slice(0, 100);
+  config.errorMessage = String(allowed.errorMessage || "").slice(0, 250);
+  config.roomPrefix = sanitizeChannelName(allowed.roomPrefix || "unban");
+  config.commandChannelId = allowed.commandChannelId || null;
+  config.privateCategoryId = allowed.privateCategoryId || null;
+  config.logsChannelId = allowed.logsChannelId || null;
+  config.guideChannelId = allowed.guideChannelId || null;
+  config.allowedRoleId = allowed.allowedRoleId || null;
+  config.adminRoleId = allowed.adminRoleId || null;
+  config.cleanupHours = Math.max(0, Math.min(720, Number(allowed.cleanupHours || 24)));
+  config.cooldownSeconds = Math.max(0, Math.min(3600, Number(allowed.cooldownSeconds || 0)));
+  config.commandDeleteSeconds = Math.max(0, Math.min(300, Number(allowed.commandDeleteSeconds || COMMAND_DELETE_SECONDS)));
+  config.dailyReportEnabled = Boolean(allowed.dailyReportEnabled);
+  config.lang = ["ar", "en"].includes(String(allowed.lang || "").toLowerCase()) ? String(allowed.lang).toLowerCase() : "en";
+  config.webhookUrl = sanitizeWebhookUrl(allowed.webhookUrl) || "";
+  const color = normalizeHexColor(allowed.embedColor || "");
+  if (color) config.embedColor = color;
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+  return config;
+}
+
+async function readImportPayload(message, args) {
+  if (message.attachments.size) {
+    const attachment = message.attachments.first();
+    if (attachment.size > 200000) throw new Error("Config file is too large.");
+    const response = await fetch(attachment.url);
+    return response.text();
+  }
+
+  const raw = args.join(" ").trim();
+  if (!raw) throw new Error("Attach a JSON file or paste JSON after `!importconfig`.");
+  if (raw.length > 200000) throw new Error("Config JSON is too large.");
+  return raw;
 }
 
 function escapeHtml(value) {
@@ -1508,48 +2415,96 @@ function renderDashboard(url) {
   const guildCards = Object.entries(guildConfigs).map(([guildId, config]) => {
     const guild = client.guilds.cache.get(guildId);
     const guildMonitors = Object.values(monitors).filter((item) => item.guildId === guildId);
-    const license = getLicenseStatus(guildId);
+    const status = getPlanStatus(guildId);
+    const activity = getDailyActivity(guildId);
+    const feedback = getFeedbackSummary(guildId);
+    const planOptions = Object.entries(PLAN_DEFINITIONS)
+      .map(([key, plan]) => `<option value="${key}"${config.plan === key ? " selected" : ""}>${escapeHtml(plan.name)}</option>`)
+      .join("");
     const recentOps = operationLogs
       .filter((item) => item.guildId === guildId)
       .slice(-6)
       .reverse()
-      .map((item) => `<li>${escapeHtml(new Date(item.at).toLocaleString())} - ${escapeHtml(item.message)}</li>`)
+      .map((item) => `<li><span>${escapeHtml(new Date(item.at).toLocaleString())}</span>${escapeHtml(item.message)}</li>`)
+      .join("");
+    const monitorChips = guildMonitors.slice(0, 20)
+      .map((item) => `<span class="chip">@${escapeHtml(item.username)} <small>${escapeHtml(item.lastStatus)}</small></span>`)
       .join("");
 
     return `
       <section class="card">
-        <div class="row">
-          <h2>${escapeHtml(guild?.name || guildId)}</h2>
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">${escapeHtml(guildId)}</p>
+            <h2>${escapeHtml(guild?.name || guildId)}</h2>
+            <p class="muted">${escapeHtml(status.label)}${config.paused ? " | Paused" : ""}</p>
+          </div>
           <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/pause${tokenSuffix}">
             <input type="hidden" name="paused" value="${config.paused ? "false" : "true"}">
-            <button>${config.paused ? "Resume" : "Pause"}</button>
+            <button class="${config.paused ? "success" : "ghost"}">${config.paused ? "Resume" : "Pause"}</button>
           </form>
         </div>
-        <p><b>License:</b> ${escapeHtml(license.label)} | <b>Sessions:</b> ${guildMonitors.length} | <b>Rooms:</b> ${Object.keys(config.rooms || {}).length}</p>
-        <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/config${tokenSuffix}" class="grid">
+
+        <div class="mini-stats">
+          <span><b>${guildMonitors.length}</b> sessions</span>
+          <span><b>${Object.keys(config.rooms || {}).length}</b> rooms</span>
+          <span><b>${activity.sessionsStarted || 0}</b> today sessions</span>
+          <span><b>${feedback.average}</b> rating</span>
+        </div>
+
+        <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/config${tokenSuffix}" class="config-grid">
           <label>Bot name <input name="botName" value="${escapeHtml(config.botName)}"></label>
           <label>Embed color <input name="embedColor" value="${escapeHtml(config.embedColor)}"></label>
           <label>Logo URL <input name="logoUrl" value="${escapeHtml(config.logoUrl)}"></label>
+          <label>Footer <input name="footerText" value="${escapeHtml(config.footerText || "")}"></label>
           <label>Room prefix <input name="roomPrefix" value="${escapeHtml(config.roomPrefix)}"></label>
+          <label>Language
+            <select name="lang">
+              <option value="en"${config.lang !== "ar" ? " selected" : ""}>English</option>
+              <option value="ar"${config.lang === "ar" ? " selected" : ""}>Arabic</option>
+            </select>
+          </label>
           <label>Command channel ID <input name="commandChannelId" value="${escapeHtml(config.commandChannelId || "")}"></label>
           <label>Private category ID <input name="privateCategoryId" value="${escapeHtml(config.privateCategoryId || "")}"></label>
           <label>Logs channel ID <input name="logsChannelId" value="${escapeHtml(config.logsChannelId || "")}"></label>
+          <label>Guide channel ID <input name="guideChannelId" value="${escapeHtml(config.guideChannelId || "")}"></label>
           <label>Allowed role ID <input name="allowedRoleId" value="${escapeHtml(config.allowedRoleId || "")}"></label>
           <label>Admin role ID <input name="adminRoleId" value="${escapeHtml(config.adminRoleId || "")}"></label>
           <label>Cleanup hours <input name="cleanupHours" type="number" min="0" max="720" value="${escapeHtml(config.cleanupHours || 24)}"></label>
-          <label class="wide">Welcome message <input name="welcomeMessage" value="${escapeHtml(config.welcomeMessage)}"></label>
+          <label>Cooldown seconds <input name="cooldownSeconds" type="number" min="0" max="3600" value="${escapeHtml(config.cooldownSeconds || 0)}"></label>
+          <label>Command delete seconds <input name="commandDeleteSeconds" type="number" min="0" max="300" value="${escapeHtml(config.commandDeleteSeconds || COMMAND_DELETE_SECONDS)}"></label>
+          <label>Daily report
+            <select name="dailyReportEnabled">
+              <option value="true"${config.dailyReportEnabled ? " selected" : ""}>On</option>
+              <option value="false"${!config.dailyReportEnabled ? " selected" : ""}>Off</option>
+            </select>
+          </label>
+          <label class="wide">Webhook URL <input name="webhookUrl" value="${escapeHtml(config.webhookUrl || "")}"></label>
+          <label class="wide">Welcome message <textarea name="welcomeMessage">${escapeHtml(config.welcomeMessage)}</textarea></label>
+          <label class="wide">Guide message <textarea name="guideMessage">${escapeHtml(config.guideMessage || "")}</textarea></label>
+          <label class="wide">Custom error message <input name="errorMessage" value="${escapeHtml(config.errorMessage || "")}"></label>
           <button class="wide">Save config</button>
         </form>
-        <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/license${tokenSuffix}" class="inline">
+
+        <form method="post" action="/dashboard/guild/${encodeURIComponent(guildId)}/license${tokenSuffix}" class="plan-row">
+          <select name="plan">${planOptions}</select>
           <input name="days" type="number" min="1" max="3650" placeholder="30">
-          <button name="action" value="set">Set license days</button>
+          <button name="action" value="set">Set plan</button>
           <button name="action" value="extend">Extend</button>
           <button name="action" value="clear">Lifetime</button>
+          <button name="action" value="${config.disabledByOwner ? "enable" : "disable"}">${config.disabledByOwner ? "Enable" : "Disable"}</button>
         </form>
-        <h3>Monitored accounts</h3>
-        <p>${guildMonitors.slice(0, 20).map((item) => `@${escapeHtml(item.username)} (${escapeHtml(item.lastStatus)})`).join(", ") || "None"}</p>
-        <h3>Last operations</h3>
-        <ul>${recentOps || "<li>No operations yet.</li>"}</ul>
+
+        <div class="split">
+          <div>
+            <h3>Monitored accounts</h3>
+            <div class="chips">${monitorChips || "<span class=\"muted\">None</span>"}</div>
+          </div>
+          <div>
+            <h3>Last operations</h3>
+            <ul class="ops">${recentOps || "<li><span>Now</span>No operations yet.</li>"}</ul>
+          </div>
+        </div>
       </section>
     `;
   }).join("");
@@ -1565,33 +2520,44 @@ function renderDashboard(url) {
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Unbans Bot Dashboard</title>
     <style>
-      body{font-family:Inter,Arial,sans-serif;background:#0f1117;color:#f4f5f7;margin:0;padding:28px}
-      h1,h2,h3{margin:0 0 12px}
-      .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0}
-      .stat,.card{background:#181b24;border:1px solid #2a2f3d;border-radius:10px;padding:16px}
-      .stat b{display:block;font-size:28px;margin-top:8px}
-      .card{margin:18px 0}
-      .row{display:flex;justify-content:space-between;gap:12px;align-items:center}
-      .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
-      .wide{grid-column:1/-1}
-      input{width:100%;box-sizing:border-box;background:#10131b;color:#fff;border:1px solid #30384a;border-radius:6px;padding:9px;margin-top:5px}
-      button{background:#7c3aed;color:white;border:0;border-radius:7px;padding:9px 12px;cursor:pointer}
-      .inline{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.inline input{width:120px}
-      table{width:100%;border-collapse:collapse}.muted{color:#9aa3b2}td,th{border-bottom:1px solid #272d3a;padding:8px;text-align:left}
+      :root{color-scheme:dark;--bg:#0b0f14;--panel:#121821;--panel2:#17202b;--line:#243142;--text:#edf3fb;--muted:#91a0b3;--accent:#22c55e;--accent2:#38bdf8;--danger:#fb7185}
+      *{box-sizing:border-box}body{font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;letter-spacing:0}
+      main{max-width:1280px;margin:0 auto}h1,h2,h3,p{margin-top:0}h1{font-size:28px;margin-bottom:6px}h2{font-size:20px;margin-bottom:4px}h3{font-size:14px;margin:18px 0 10px;color:#cbd5e1}
+      .topbar{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;margin-bottom:18px}.muted,.eyebrow{color:var(--muted)}.eyebrow{font-size:12px;margin:0 0 4px}
+      .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
+      .stat,.card{background:linear-gradient(180deg,var(--panel),#0f151d);border:1px solid var(--line);border-radius:8px;padding:16px}
+      .stat span{display:block;color:var(--muted);font-size:13px}.stat b{display:block;font-size:28px;margin-top:8px}
+      .card{margin:16px 0}.card-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:14px}
+      .mini-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:10px 0 16px}.mini-stats span{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--muted)}.mini-stats b{color:var(--text)}
+      .config-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.wide{grid-column:1/-1}
+      label{color:#cbd5e1;font-size:13px}input,textarea,select{width:100%;margin-top:6px;background:#0b1118;color:var(--text);border:1px solid #2a394b;border-radius:6px;padding:9px;font:inherit}textarea{min-height:72px;resize:vertical}
+      button{background:#2563eb;color:white;border:0;border-radius:6px;padding:9px 12px;cursor:pointer;font-weight:700}.ghost{background:#243142}.success{background:var(--accent);color:#04130a}
+      .plan-row{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.plan-row input{width:110px}.plan-row select{width:150px}
+      .split{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.8fr);gap:16px}.chips{display:flex;gap:8px;flex-wrap:wrap}.chip{background:#0b1118;border:1px solid #2a394b;border-radius:999px;padding:6px 10px}.chip small{color:var(--muted);margin-left:6px}
+      .ops{padding:0;margin:0;list-style:none}.ops li{border-bottom:1px solid var(--line);padding:8px 0}.ops span{display:block;color:var(--muted);font-size:12px;margin-bottom:2px}
+      table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid var(--line);padding:9px;text-align:left}
+      @media(max-width:720px){body{padding:14px}.topbar,.card-head,.split{display:block}.plan-row select,.plan-row input{width:100%}}
     </style>
   </head>
   <body>
-    <h1>Unbans Bot Dashboard</h1>
-    <p class="muted">Status: ${stats.online ? "Online" : "Offline"} | Uptime: ${escapeHtml(stats.uptime)} | Data: ${escapeHtml(DATA_DIR)}</p>
-    <div class="stats">
-      <div class="stat">Servers <b>${stats.servers}</b></div>
-      <div class="stat">Sessions <b>${stats.sessions}</b></div>
-      <div class="stat">Private rooms <b>${stats.rooms}</b></div>
-      <div class="stat">Today unbans <b>${stats.todayUnbans}</b></div>
-      <div class="stat">Storage <b>${stats.storageOk ? "OK" : "ERR"}</b></div>
-    </div>
-    ${guildCards || "<p>No server configs yet. Run setup commands in Discord first.</p>"}
-    <section class="card"><h2>Recent Unbans</h2><table><tr><th>Username</th><th>Followers</th><th>When</th></tr>${recentRows}</table></section>
+    <main>
+      <div class="topbar">
+        <div>
+          <h1>Unbans Bot Dashboard</h1>
+          <p class="muted">Status: ${stats.online ? "Online" : "Offline"} | Uptime: ${escapeHtml(stats.uptime)} | Data: ${escapeHtml(DATA_DIR)}</p>
+        </div>
+        <p class="muted">Backups: ${escapeHtml(BACKUPS_DIR)}</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><span>Servers</span><b>${stats.servers}</b></div>
+        <div class="stat"><span>Sessions</span><b>${stats.sessions}</b></div>
+        <div class="stat"><span>Private rooms</span><b>${stats.rooms}</b></div>
+        <div class="stat"><span>Today unbans</span><b>${stats.todayUnbans}</b></div>
+        <div class="stat"><span>Storage</span><b>${stats.storageOk ? "OK" : "ERR"}</b></div>
+      </div>
+      ${guildCards || "<p>No server configs yet. Run setup commands in Discord first.</p>"}
+      <section class="card"><h2>Recent Unbans</h2><table><tr><th>Username</th><th>Followers</th><th>When</th></tr>${recentRows}</table></section>
+    </main>
   </body></html>`;
 }
 
@@ -1629,13 +2595,25 @@ async function handleDashboardPost(req, res, url) {
     config.botName = body.get("botName") || "";
     config.logoUrl = body.get("logoUrl") || "";
     config.welcomeMessage = (body.get("welcomeMessage") || "").slice(0, 500);
+    config.guideMessage = (body.get("guideMessage") || "").slice(0, 1500);
+    config.footerText = (body.get("footerText") || "").slice(0, 100);
+    config.errorMessage = (body.get("errorMessage") || "").slice(0, 250);
     config.roomPrefix = sanitizeChannelName(body.get("roomPrefix") || "unban");
     config.commandChannelId = body.get("commandChannelId") || null;
     config.privateCategoryId = body.get("privateCategoryId") || null;
     config.logsChannelId = body.get("logsChannelId") || null;
+    config.guideChannelId = body.get("guideChannelId") || null;
     config.allowedRoleId = body.get("allowedRoleId") || null;
     config.adminRoleId = body.get("adminRoleId") || null;
     config.cleanupHours = Math.max(0, Math.min(720, Number(body.get("cleanupHours") || 24)));
+    config.cooldownSeconds = Math.max(0, Math.min(3600, Number(body.get("cooldownSeconds") || 0)));
+    config.commandDeleteSeconds = Math.max(0, Math.min(300, Number(body.get("commandDeleteSeconds") || COMMAND_DELETE_SECONDS)));
+    config.dailyReportEnabled = body.get("dailyReportEnabled") === "true";
+    config.lang = ["ar", "en"].includes(String(body.get("lang") || "").toLowerCase())
+      ? String(body.get("lang")).toLowerCase()
+      : "en";
+    const webhook = sanitizeWebhookUrl(body.get("webhookUrl") || "");
+    if (webhook !== null) config.webhookUrl = webhook;
     const color = normalizeHexColor(body.get("embedColor") || "");
     if (color) config.embedColor = color;
     config.updatedAt = Date.now();
@@ -1651,14 +2629,27 @@ async function handleDashboardPost(req, res, url) {
 
   if (action === "license") {
     const licenseAction = body.get("action");
+    const planKey = String(body.get("plan") || config.plan || "trial").toLowerCase();
     const days = Math.max(1, Math.min(3650, Number(body.get("days") || 30)));
+    if (PLAN_DEFINITIONS[planKey]) config.plan = planKey;
 
-    if (licenseAction === "clear") config.licenseExpiresAt = null;
-    if (licenseAction === "set") config.licenseExpiresAt = Date.now() + days * 24 * 60 * 60 * 1000;
-    if (licenseAction === "extend") {
-      const base = config.licenseExpiresAt && config.licenseExpiresAt > Date.now() ? config.licenseExpiresAt : Date.now();
-      config.licenseExpiresAt = base + days * 24 * 60 * 60 * 1000;
+    if (licenseAction === "clear") {
+      config.licenseExpiresAt = null;
+      config.planExpiresAt = null;
+      config.plan = "vip";
     }
+    if (licenseAction === "set") {
+      config.planExpiresAt = Date.now() + days * 24 * 60 * 60 * 1000;
+      config.licenseExpiresAt = config.planExpiresAt;
+      config.disabledByOwner = false;
+    }
+    if (licenseAction === "extend") {
+      const base = config.planExpiresAt && config.planExpiresAt > Date.now() ? config.planExpiresAt : Date.now();
+      config.planExpiresAt = base + days * 24 * 60 * 60 * 1000;
+      config.licenseExpiresAt = config.planExpiresAt;
+    }
+    if (licenseAction === "disable") config.disabledByOwner = true;
+    if (licenseAction === "enable") config.disabledByOwner = false;
 
     config.updatedAt = Date.now();
     saveGuildConfigs();
@@ -1761,6 +2752,15 @@ async function sendRecovered(channel, username, result, duration, meta = null) {
   const payload = recoveredEmbed(username, result, duration, meta?.guildId);
   await channel.send(payload);
   recordRecentUnban(meta, username, result, duration);
+  if (meta?.guildId) {
+    await emitWebhookEvent(meta.guildId, "account_recovered", {
+      userId: meta.userId || "",
+      username,
+      followers: result.stats?.followers || "0",
+      following: result.stats?.following || "0",
+      duration,
+    });
+  }
   safeDelete(result.screenshot);
 }
 
@@ -1778,6 +2778,20 @@ async function startMonitoringUsernames(context, usernames) {
     return;
   }
 
+  const cooldown = checkCooldown(guildId, userId, "start");
+  if (!cooldown.allowed) {
+    await channel.send(`Please wait ${cooldown.remaining}s before starting another session.`);
+    return;
+  }
+
+  const dailyBlock = consumeDailySession(guildId, userId);
+  if (dailyBlock) {
+    await channel.send(dailyBlock);
+    return;
+  }
+
+  markCooldown(guildId, userId, "start");
+
   await channel.send(`Checking ${usernames.map((u) => `@${u}`).join(", ")}...`);
 
   for (const username of usernames) {
@@ -1794,6 +2808,7 @@ async function startMonitoringUsernames(context, usernames) {
     if (result.status === "error") {
       await channel.send(`Error checking @${username}\n\`${result.error}\``);
       await sendGuildLog(guildId, "Instagram check error", { username, error: result.error });
+      await reportError(new Error(result.error), { guildId, userId, command: "!t" });
       continue;
     }
 
@@ -1804,6 +2819,7 @@ async function startMonitoringUsernames(context, usernames) {
       channelId: channel.id,
       lastStatus: result.status === "active" ? "active" : result.status,
       startedAt,
+      sessionExpiresAt: getSessionExpiresAt(guildId),
       bannedStartedAt: result.status === "active" ? null : startedAt,
       activeHits: 0,
     };
@@ -1823,6 +2839,12 @@ async function startMonitoringUsernames(context, usernames) {
       status: result.status,
       channel: channel.id,
     });
+    await emitWebhookEvent(guildId, "session_started", {
+      userId,
+      username,
+      status: result.status,
+      channelId: channel.id,
+    });
   }
 }
 
@@ -1837,8 +2859,10 @@ async function stopMonitoringUsername(context, username) {
 
   delete monitors[key];
   saveMonitors();
+  incrementActivity(guildId, "stopped", userId);
   await channel.send(`Stopped monitoring @${username}.`);
   await sendGuildLog(guildId, "Monitoring stopped", { userId, username });
+  await emitWebhookEvent(guildId, "session_stopped", { userId, username });
 }
 
 async function clearUserMonitoring(context) {
@@ -1853,8 +2877,10 @@ async function clearUserMonitoring(context) {
   }
 
   saveMonitors();
+  incrementActivity(guildId, "cleared", userId);
   await channel.send(`Cleared ${removed} monitored account(s).`);
   await sendGuildLog(guildId, "Monitoring list cleared", { userId, removed });
+  await emitWebhookEvent(guildId, "sessions_cleared", { userId, removed });
 }
 
 async function sendUserMonitorList(context) {
@@ -1866,6 +2892,17 @@ async function sendUserMonitorList(context) {
   await channel.send(entries || "You are not monitoring any accounts.");
 }
 
+function formatMonitorEntries(guildId, userId) {
+  return getUserMonitorEntries(guildId, userId)
+    .map(([, item]) => `- @${item.username} - ${item.lastStatus}`)
+    .join("\n");
+}
+
+async function sendUserMonitorList(context) {
+  const { guildId, userId, channel } = context;
+  await channel.send(formatMonitorEntries(guildId, userId) || "You are not monitoring any accounts.");
+}
+
 client.once("ready", async () => {
   console.log(`Discord bot online: ${client.user.tag}`);
   console.log(`Persistent data directory: ${DATA_DIR}`);
@@ -1873,7 +2910,13 @@ client.once("ready", async () => {
   loadMonitors();
   loadGuildConfigs();
   loadRecentUnbans();
+  for (const guild of client.guilds.cache.values()) {
+    getGuildConfig(guild.id);
+  }
+  saveGuildConfigs();
   startDashboard();
+  startBackupLoop();
+  startDailyReportLoop();
 
   sharedBrowser = await launchBrowser();
 
@@ -1886,6 +2929,21 @@ client.once("ready", async () => {
   }), 1000 * 60 * 15);
 
   startMonitorLoop();
+});
+
+client.on("guildCreate", async (guild) => {
+  const config = getGuildConfig(guild.id);
+  config.plan = "trial";
+  config.planExpiresAt = addDays(Date.now(), TRIAL_DAYS);
+  config.trialStartedAt = Date.now();
+  config.trialEndsAt = config.planExpiresAt;
+  config.updatedAt = Date.now();
+  saveGuildConfigs();
+  await sendOwnerReport("Bot added to server", {
+    server: guild.name,
+    serverId: guild.id,
+    trialDays: TRIAL_DAYS,
+  });
 });
 
 client.on("messageCreate", async (message) => {
@@ -2050,6 +3108,280 @@ client.on("messageCreate", async (message) => {
   const userId = message.author.id;
   const config = getGuildConfig(guildId);
 
+  if (command === "!owner") {
+    if (!isOwner(userId)) return message.reply("Owner only.");
+
+    const action = (args.shift() || "help").toLowerCase();
+    if (action === "guilds") {
+      const lines = client.guilds.cache.map((guild) => {
+        const status = getPlanStatus(guild.id);
+        return `${guild.name} - ${guild.id} - ${status.label}`;
+      });
+      return message.reply(lines.join("\n").slice(0, 1900) || "No guilds.");
+    }
+
+    if (action === "stats") {
+      const stats = dashboardStats();
+      const planCounts = {};
+      for (const id of Object.keys(guildConfigs)) {
+        const plan = getGuildConfig(id).plan || "trial";
+        planCounts[plan] = (planCounts[plan] || 0) + 1;
+      }
+      return message.reply(
+        `Servers: ${stats.servers}\n` +
+        `Sessions: ${stats.sessions}\n` +
+        `Rooms: ${stats.rooms}\n` +
+        `Storage: ${stats.storageOk ? "OK" : "ERR"}\n` +
+        `Plans: ${Object.entries(planCounts).map(([plan, count]) => `${plan}=${count}`).join(", ") || "none"}`
+      );
+    }
+
+    if (action === "disable" || action === "enable") {
+      const targetGuildId = args[0];
+      if (!targetGuildId) return message.reply("Use: `!owner disable <serverId>` or `!owner enable <serverId>`.");
+      const targetConfig = getGuildConfig(targetGuildId);
+      targetConfig.disabledByOwner = action === "disable";
+      targetConfig.updatedAt = Date.now();
+      saveGuildConfigs();
+      return message.reply(`Server ${targetGuildId} ${action === "disable" ? "disabled" : "enabled"}.`);
+    }
+
+    if (action === "extend") {
+      const targetGuildId = args[0];
+      const days = parseDaysInput(args[1], 30);
+      if (!targetGuildId) return message.reply("Use: `!owner extend <serverId> 30`.");
+      const targetConfig = getGuildConfig(targetGuildId);
+      const base = targetConfig.planExpiresAt && targetConfig.planExpiresAt > Date.now() ? targetConfig.planExpiresAt : Date.now();
+      targetConfig.planExpiresAt = addDays(base, days);
+      targetConfig.licenseExpiresAt = targetConfig.planExpiresAt;
+      targetConfig.updatedAt = Date.now();
+      saveGuildConfigs();
+      return message.reply(`Extended ${targetGuildId} for ${days} day(s).`);
+    }
+
+    if (action === "broadcast") {
+      const text = args.join(" ").trim();
+      if (!text) return message.reply("Use: `!owner broadcast <message>`.");
+      const result = await broadcastToGuilds(text);
+      return message.reply(`Broadcast sent to ${result.sent} server(s), failed ${result.failed}.`);
+    }
+
+    if (action === "backup") {
+      const filePath = createBackup();
+      const file = new AttachmentBuilder(filePath);
+      await sendOwnerReport("Manual backup created", { file: filePath }, [file]);
+      return message.reply(`Backup created: ${filePath}`);
+    }
+
+    return message.reply("Owner commands: `guilds`, `stats`, `disable`, `enable`, `extend`, `broadcast`, `backup`.");
+  }
+
+  if (command === "!broadcast") {
+    if (!isOwner(userId)) return message.reply("Owner only.");
+    const text = args.join(" ").trim();
+    if (!text) return message.reply("Use: `!broadcast <message>`.");
+    const result = await broadcastToGuilds(text);
+    return message.reply(`Broadcast sent to ${result.sent} server(s), failed ${result.failed}.`);
+  }
+
+  if (command === "!plan") {
+    const action = (args.shift() || "info").toLowerCase();
+
+    if (action === "info") {
+      const status = getPlanStatus(guildId);
+      return message.reply(`Plan: **${status.label}**\n${getPlanLimitsText(guildId)}`);
+    }
+
+    if (action === "limits") {
+      return message.reply(`\`\`\`\n${getPlanLimitsText(guildId)}\n\`\`\``);
+    }
+
+    if (action === "set") {
+      if (!isOwner(userId)) return message.reply("Only the bot owner can change paid plans.");
+      const planKey = (args.shift() || "").toLowerCase();
+      if (!PLAN_DEFINITIONS[planKey]) return message.reply("Use: `!plan set trial|free|basic|pro|vip 30d`.");
+      const days = parseDaysInput(args[0], planKey === "trial" ? TRIAL_DAYS : 30);
+      config.plan = planKey;
+      config.planExpiresAt = addDays(Date.now(), days);
+      config.licenseExpiresAt = config.planExpiresAt;
+      if (planKey === "trial") {
+        config.trialStartedAt = Date.now();
+        config.trialEndsAt = config.planExpiresAt;
+      }
+      config.disabledByOwner = false;
+      config.updatedAt = Date.now();
+      saveGuildConfigs();
+      await sendGuildLog(guildId, "Plan updated", { plan: planKey, days, by: message.author.tag });
+      return message.reply(`Plan set to **${PLAN_DEFINITIONS[planKey].name}** for ${days} day(s).`);
+    }
+
+    return message.reply("Use: `!plan info`, `!plan limits`, `!plan set pro 30d`.");
+  }
+
+  if (command === "!support") {
+    const room = config.rooms?.[userId] ? `<#${config.rooms[userId]}>` : `#${message.channel.name}`;
+    const invite = await message.channel.createInvite({
+      maxAge: 24 * 60 * 60,
+      maxUses: 1,
+      unique: true,
+      reason: "Support request",
+    }).then((created) => created.url).catch(() => "");
+    await sendOwnerReport("Support request", {
+      server: message.guild.name,
+      serverId: guildId,
+      user: message.author.tag,
+      userId,
+      room,
+      invite,
+      message: args.join(" ").trim() || "Client needs help.",
+    });
+    await sendGuildLog(guildId, "Support request sent", { user: message.author.tag });
+    return message.reply("Support request sent. The owner will contact you.");
+  }
+
+  if (command === "!quicksetup") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    return runQuickSetup(message, args.join(" "));
+  }
+
+  if (command === "!setup") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    return runSetupWizard(message);
+  }
+
+  if (command === "!setupguide") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const channel = resolveTextChannel(message, args);
+    config.guideChannelId = channel.id;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    await publishGuide(message.guild, channel);
+    return message.reply(`Guide published in ${channel}.`);
+  }
+
+  if (command === "!setguide") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    config.guideMessage = args.join(" ").trim().slice(0, 1500);
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply("Guide message updated. Run `!setupguide` to publish it.");
+  }
+
+  if (command === "!setwelcome") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    config.welcomeMessage = args.join(" ").trim().slice(0, 500);
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply("Welcome message updated.");
+  }
+
+  if (command === "!setlang") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const lang = (args[0] || "").toLowerCase();
+    if (!["ar", "en"].includes(lang)) return message.reply("Use: `!setlang ar` or `!setlang en`.");
+    config.lang = lang;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(`Language set to ${lang}.`);
+  }
+
+  if (command === "!setcolor") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const block = getFeatureBlockReason(guildId, "white_label");
+    if (block) return message.reply(block);
+    const color = normalizeHexColor(args[0] || "");
+    if (!color) return message.reply("Use a hex color like `#ff0055`.");
+    config.embedColor = color;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(`Embed color set to ${color}.`);
+  }
+
+  if (command === "!setlogo") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const block = getFeatureBlockReason(guildId, "white_label");
+    if (block) return message.reply(block);
+    const url = args.join(" ").trim();
+    if (url && !/^https?:\/\//i.test(url)) return message.reply("Logo must be a URL or empty.");
+    config.logoUrl = url;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(url ? "Logo updated." : "Logo cleared.");
+  }
+
+  if (command === "!setfooter") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const block = getFeatureBlockReason(guildId, "white_label");
+    if (block) return message.reply(block);
+    config.footerText = args.join(" ").trim().slice(0, 100);
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply("Footer updated.");
+  }
+
+  if (command === "!setwebhook") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const block = getFeatureBlockReason(guildId, "webhook");
+    if (block) return message.reply(block);
+    const webhook = sanitizeWebhookUrl(args.join(" "));
+    if (webhook === null) return message.reply("Use a valid HTTPS webhook URL, or `!setwebhook clear`.");
+    config.webhookUrl = webhook;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(webhook ? "Webhook updated." : "Webhook cleared.");
+  }
+
+  if (command === "!setupcooldown") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const seconds = Math.max(0, Math.min(3600, Number(args[0] || 0)));
+    config.cooldownSeconds = seconds;
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(seconds ? `Cooldown set to ${seconds}s.` : "Cooldown disabled.");
+  }
+
+  if (command === "!setupdailyreport") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const block = getFeatureBlockReason(guildId, "daily_report");
+    if (block) return message.reply(block);
+    const value = (args[0] || "on").toLowerCase();
+    if (value === "test") {
+      const sent = await sendDailyActivityReport(guildId, true);
+      return message.reply(sent ? "Daily report sent." : "Set logs channel first with `!setuplogs #bot-logs`.");
+    }
+    config.dailyReportEnabled = value !== "off";
+    config.updatedAt = Date.now();
+    saveGuildConfigs();
+    return message.reply(config.dailyReportEnabled ? "Daily report enabled." : "Daily report disabled.");
+  }
+
+  if (command === "!exportconfig") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      guildId,
+      config: exportableGuildConfig(config),
+    };
+    const file = new AttachmentBuilder(Buffer.from(JSON.stringify(payload, null, 2)), {
+      name: `unbans-config-${guildId}.json`,
+    });
+    return message.reply({ content: "Server config export ready.", files: [file] });
+  }
+
+  if (command === "!importconfig") {
+    if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    try {
+      const raw = await readImportPayload(message, args);
+      const imported = JSON.parse(raw);
+      applyImportedGuildConfig(guildId, imported);
+      if (config.botName) await applyServerBotName(message, config.botName);
+      return message.reply("Config imported. Run `!setupinfo` to review it.");
+    } catch (error) {
+      return message.reply(`Import failed: ${error.message}`);
+    }
+  }
+
   if (command === "!help") {
     return message.channel.send({ embeds: [buildHelpEmbed(message.guild)] });
   }
@@ -2168,11 +3500,14 @@ client.on("messageCreate", async (message) => {
     }
 
     if (action === "set" || action === "extend") {
+      if (!isOwner(userId)) return message.reply("Only the bot owner can update licenses.");
       const days = Math.max(1, Math.min(3650, Number(args[0] || 30)));
       const base = action === "extend" && config.licenseExpiresAt && config.licenseExpiresAt > Date.now()
         ? config.licenseExpiresAt
         : Date.now();
       config.licenseExpiresAt = base + days * 24 * 60 * 60 * 1000;
+      config.planExpiresAt = config.licenseExpiresAt;
+      if (!config.plan || config.plan === "trial") config.plan = "basic";
       config.updatedAt = Date.now();
       saveGuildConfigs();
       await sendGuildLog(guildId, "License updated", { action, days, expiresAt: new Date(config.licenseExpiresAt).toISOString() });
@@ -2180,7 +3515,10 @@ client.on("messageCreate", async (message) => {
     }
 
     if (action === "clear" || action === "lifetime") {
+      if (!isOwner(userId)) return message.reply("Only the bot owner can update licenses.");
       config.licenseExpiresAt = null;
+      config.planExpiresAt = null;
+      config.plan = "vip";
       config.updatedAt = Date.now();
       saveGuildConfigs();
       return message.reply("License set to Lifetime.");
@@ -2191,6 +3529,8 @@ client.on("messageCreate", async (message) => {
 
   if (command === "!setupbrand") {
     if (!isAdmin(message.member)) return message.reply("You need Manage Server permission to use setup commands.");
+    const block = getFeatureBlockReason(guildId, "white_label");
+    if (block) return message.reply(block);
 
     const field = (args.shift() || "").toLowerCase();
     const value = args.join(" ").trim();
@@ -2214,8 +3554,14 @@ client.on("messageCreate", async (message) => {
       config.roomPrefix = prefix;
     } else if (field === "welcome") {
       config.welcomeMessage = value.slice(0, 500);
+    } else if (field === "guide") {
+      config.guideMessage = value.slice(0, 1500);
+    } else if (field === "footer") {
+      config.footerText = value.slice(0, 100);
+    } else if (field === "error") {
+      config.errorMessage = value.slice(0, 250);
     } else {
-      return message.reply("Use: `!setupbrand name|color|logo|roomprefix|welcome <value>`.");
+      return message.reply("Use: `!setupbrand name|color|logo|roomprefix|welcome|guide|footer|error <value>`.");
     }
 
     config.updatedAt = Date.now();
@@ -2239,9 +3585,14 @@ client.on("messageCreate", async (message) => {
         `**Logs channel:** ${config.logsChannelId ? `<#${config.logsChannelId}>` : "Not set"}\n` +
         `**Allowed role:** ${config.allowedRoleId ? `<@&${config.allowedRoleId}>` : "Everyone"}\n` +
         `**Admin role:** ${config.adminRoleId ? `<@&${config.adminRoleId}>` : "Manage Server"}\n` +
-        `**License:** ${getLicenseStatus(guildId).label}\n` +
+        `**Plan:** ${getPlanStatus(guildId).label}\n` +
         `**Paused:** ${config.paused ? "Yes" : "No"}\n` +
         `**Auto cleanup:** ${config.cleanupHours || 0}h\n` +
+        `**Cooldown:** ${config.cooldownSeconds || 0}s\n` +
+        `**Language:** ${config.lang || "en"}\n` +
+        `**Daily report:** ${config.dailyReportEnabled ? "On" : "Off"}\n` +
+        `**Guide channel:** ${config.guideChannelId ? `<#${config.guideChannelId}>` : "Not set"}\n` +
+        `**Webhook:** ${config.webhookUrl ? "Set" : "Not set"}\n` +
         `**Private rooms:** ${Object.keys(config.rooms || {}).length}`
       );
 
@@ -2250,15 +3601,26 @@ client.on("messageCreate", async (message) => {
 
   if (command === "!chat") {
     if (!canUseBot(message.member)) return message.reply("You do not have permission to use this bot.");
-    if (!getLicenseStatus(guildId).active) return message.reply("This server license has expired. Contact support.");
+    const planStatus = getPlanStatus(guildId);
+    if (!planStatus.active) return message.reply(planStatus.reason);
+
+    const cooldown = checkCooldown(guildId, userId, "chat");
+    if (!cooldown.allowed) return message.reply(`Please wait ${cooldown.remaining}s before opening another room.`);
 
     try {
       const room = await ensureUserRoom(message);
       touchUserRoom(guildId, userId);
-      return message.reply(`Your private bot room is ${room}.`);
+      markCooldown(guildId, userId, "chat");
+      const reply = await message.reply(`Your private bot room is ${room}.`);
+      deleteMessageLater(message, config.commandDeleteSeconds || COMMAND_DELETE_SECONDS);
+      deleteMessageLater(reply, config.commandDeleteSeconds || COMMAND_DELETE_SECONDS);
+      return;
     } catch (error) {
       console.log("Create private room error:", error.message);
-      return message.reply("I could not create your private room. Give me Manage Channels permission.");
+      if (error.code === "PLAN_LIMIT") return message.reply(error.message);
+      const text = config.errorMessage || "I could not create your private room. Give me Manage Channels permission.";
+      await reportError(error, { guildId, userId, command: "!chat", message });
+      return message.reply(text);
     }
   }
 
@@ -2274,12 +3636,17 @@ client.on("messageCreate", async (message) => {
     return message.reply("You do not have permission to use this bot.");
   }
 
-  if (!getLicenseStatus(guildId).active && command !== "!health") {
-    return message.reply("This server license has expired. Contact support.");
+  const planStatus = getPlanStatus(guildId);
+  if (!planStatus.active && command !== "!health") {
+    return message.reply(planStatus.reason);
   }
 
   if (config.paused && monitorCommands.has(command)) {
     return message.reply("Bot is paused for new monitoring sessions.");
+  }
+
+  if (command === "!health") {
+    return message.channel.send({ embeds: [buildHealthEmbed(message.guild)] });
   }
 
   let targetChannel;
@@ -2287,7 +3654,9 @@ client.on("messageCreate", async (message) => {
     targetChannel = await getUserCommandChannel(message);
   } catch (error) {
     console.log("Private command channel error:", error.message);
-    return message.reply("I could not open your private bot room. Give me Manage Channels permission.");
+    if (error.code === "PLAN_LIMIT") return message.reply(error.message);
+    await reportError(error, { guildId, userId, command, message });
+    return message.reply(config.errorMessage || "I could not open your private bot room. Give me Manage Channels permission.");
   }
 
   if (!targetChannel) return;
@@ -2310,6 +3679,11 @@ client.on("messageCreate", async (message) => {
 
   if (command === "!clearall") {
     return clearUserMonitoring({ guildId, userId, channel: targetChannel });
+  }
+
+  if (command === "!list") {
+    const entries = formatMonitorEntries(guildId, userId);
+    return targetChannel.send(entries || "You are not monitoring any accounts.");
   }
 
   if (command === "!list") {
@@ -2345,13 +3719,16 @@ client.on("messageCreate", async (message) => {
       return targetChannel.send(`This room will close in ${args[0]}.`);
     }
 
-    await targetChannel.send("Closing this room...");
-    setTimeout(() => closeUserRoom(message.guild, userId, "User requested close"), 1500);
-    return;
+    return requestRoomRatingAndClose(message.guild, userId, targetChannel, "User requested close");
   }
 
   if (command === "!sesun") {
-    const hours = Math.max(1, Math.min(168, Number(args[0] || 24)));
+    const requested = Math.max(1, Math.min(168, Number(args[0] || 24)));
+    const maxHours = getPlanStatus(guildId).plan.maxSessionHours;
+    if (requested > maxHours) {
+      return targetChannel.send(`Your plan allows up to ${maxHours} hour(s) for session history.`);
+    }
+    const hours = requested;
     return targetChannel.send({ embeds: [buildRecentUnbansEmbed(message, hours)] });
   }
 });
@@ -2373,12 +3750,23 @@ client.on("interactionCreate", async (interaction) => {
 
     touchUserRoom(guildId, userId);
 
+    if (interaction.isButton() && interaction.customId.startsWith("bot:rate:")) {
+      const score = Number(interaction.customId.split(":").pop());
+      recordRating(guildId, userId, score);
+      await sendGuildLog(guildId, "User rating received", { userId, score });
+      await emitWebhookEvent(guildId, "rating_received", { userId, score });
+      await interaction.reply({ content: `Thanks. Rating saved: ${score}/5.`, ephemeral: true });
+      setTimeout(() => closeUserRoom(interaction.guild, userId, "Rated and closed").catch(() => {}), 2000);
+      return;
+    }
+
     if (!canUseBot(interaction.member)) {
       return interaction.reply({ content: "You do not have permission to use this bot.", ephemeral: true });
     }
 
-    if (!getLicenseStatus(guildId).active) {
-      return interaction.reply({ content: "This server license has expired. Contact support.", ephemeral: true });
+    const planStatus = getPlanStatus(guildId);
+    if (!planStatus.active) {
+      return interaction.reply({ content: planStatus.reason, ephemeral: true });
     }
 
     if (interaction.isButton()) {
@@ -2432,9 +3820,8 @@ client.on("interactionCreate", async (interaction) => {
         const active = getUserMonitorEntries(guildId, userId).length;
         if (active > 0) return interaction.editReply("Clear your monitored accounts before closing this room.");
 
-        await interaction.channel.send("Closing this room...");
-        setTimeout(() => closeUserRoom(interaction.guild, userId, "User clicked close"), 1500);
-        return interaction.editReply("Closing.");
+        await requestRoomRatingAndClose(interaction.guild, userId, interaction.channel, "User clicked close");
+        return interaction.editReply("Rating requested. Room will close soon.");
       }
 
       return interaction.editReply("Unknown button.");
@@ -2461,6 +3848,12 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (error) {
     console.log("Interaction error:", error.message);
+    await reportError(error, {
+      guildId: interaction.guild?.id,
+      userId: interaction.user?.id,
+      userTag: interaction.user?.tag,
+      command: interaction.customId || "interaction",
+    }).catch(() => {});
     if (interaction.isRepliable?.() && !interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: "Something went wrong.", ephemeral: true }).catch(() => {});
     }
@@ -2472,6 +3865,23 @@ function startMonitorLoop() {
     const entries = Object.entries(monitors);
 
     for (const [key, item] of entries) {
+      if (item.sessionExpiresAt && item.sessionExpiresAt <= Date.now()) {
+        delete monitors[key];
+        saveMonitors();
+        client.channels.fetch(item.channelId)
+          .then((channel) => channel?.send?.(`Session expired for @${item.username}.`).catch(() => {}))
+          .catch(() => {});
+        sendGuildLog(item.guildId, "Monitoring session expired", {
+          userId: item.userId,
+          username: item.username,
+        }).catch(() => {});
+        emitWebhookEvent(item.guildId, "session_expired", {
+          userId: item.userId,
+          username: item.username,
+        }).catch(() => {});
+        continue;
+      }
+
       enqueueCheck(item.username)
         .then(async (result) => {
           if (result.status === "error") {
@@ -2532,9 +3942,25 @@ function startMonitorLoop() {
         })
         .catch((error) => {
           console.log("Monitor error:", error.message);
+          reportError(error, {
+            guildId: item.guildId,
+            userId: item.userId,
+            command: "monitor-loop",
+          }).catch(() => {});
         });
     }
   }, CHECK_EVERY_SECONDS * 1000);
 }
+
+process.on("unhandledRejection", (error) => {
+  const err = error instanceof Error ? error : new Error(String(error));
+  console.log("Unhandled rejection:", err.message);
+  reportError(err, { command: "unhandledRejection" }).catch(() => {});
+});
+
+process.on("uncaughtException", (error) => {
+  console.log("Uncaught exception:", error.message);
+  reportError(error, { command: "uncaughtException" }).catch(() => {});
+});
 
 client.login(process.env.DISCORD_BOT_TOKEN);
